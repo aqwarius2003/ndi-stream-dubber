@@ -42,6 +42,31 @@ def test_broadcast_chunk_properties():
     with pytest.raises(FrozenInstanceError):
         chunk.block_index = 43  # immutable (frozen)
 
+    # Defensively handles zero or negative sample_rate and channels
+    invalid_sr_chunk = BroadcastAudioChunk(
+        session_id="test_session",
+        language="en",
+        source_branch="gemini",
+        block_index=42,
+        source_time=102.5,
+        sample_rate=0,
+        channels=1,
+        pcm_data=pcm_48k,
+    )
+    assert invalid_sr_chunk.duration_ms == 0.0
+
+    invalid_ch_chunk = BroadcastAudioChunk(
+        session_id="test_session",
+        language="en",
+        source_branch="gemini",
+        block_index=42,
+        source_time=102.5,
+        sample_rate=48000,
+        channels=0,
+        pcm_data=pcm_48k,
+    )
+    assert invalid_ch_chunk.duration_ms == 0.0
+
 
 def test_branch_state_freshness():
     state = BranchState(
@@ -69,3 +94,14 @@ def test_branch_state_freshness():
 
     state.status = "STARTING"
     assert state.is_fresh(current_time=100.3, max_age_s=0.5) is False
+
+    # Uninitialized branch (last_audio_time <= 0.0) is never fresh
+    state.status = "READY"
+    state.last_audio_time = 0.0
+    assert state.is_fresh(current_time=100.3, max_age_s=0.5) is False
+    state.last_audio_time = -1.0
+    assert state.is_fresh(current_time=100.3, max_age_s=0.5) is False
+
+    # Clock skew / negative age (current_time < last_audio_time) is not fresh
+    state.last_audio_time = 100.0
+    assert state.is_fresh(current_time=99.5, max_age_s=0.5) is False

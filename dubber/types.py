@@ -42,6 +42,8 @@ class BroadcastAudioChunk:
 
     @property
     def duration_ms(self) -> float:
+        if self.sample_rate <= 0 or self.channels <= 0:
+            return 0.0
         bytes_per_sample = 2 * self.channels
         samples = len(self.pcm_data) / bytes_per_sample
         return (samples / self.sample_rate) * 1000.0
@@ -60,4 +62,7 @@ class BranchState:
     def is_fresh(self, current_time: float, max_age_s: float = 0.5) -> bool:
         if self.status not in ("READY", "RUNNING"):
             return False
-        return (current_time - self.last_audio_time) <= max_age_s
+        if self.last_audio_time <= 0.0:
+            return False
+        age = current_time - self.last_audio_time
+        return 0.0 <= age <= max_age_s
