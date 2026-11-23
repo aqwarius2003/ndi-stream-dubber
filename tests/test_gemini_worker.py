@@ -291,3 +291,95 @@ async def test_gemini_worker_reconnect_success(tmp_path):
 
         await worker.stop()
 
+
+@pytest.mark.asyncio
+async def test_gemini_worker_restart_no_leftover_none(tmp_path):
+    queue = asyncio.Queue(maxsize=10)
+    log_file = str(tmp_path / "transcript_gemini.jsonl")
+    worker = GeminiWorker(
+        queue_in=queue,
+        mode="mock",
+        transcript_path=log_file,
+        simulated_delay_s=0.01,
+    )
+    # First cycle
+    await worker.start()
+    await worker.stop()
+    assert worker.get_state().status == "STOPPED"
+
+    # Second cycle (restart)
+    await worker.start()
+    assert worker.get_state().status in ("READY", "RUNNING")
+
+    # Send audio block to restarted worker
+    pcm = (np.zeros(320, dtype=np.int16)).tobytes()
+    for i in range(5):
+        await queue.put(AudioBlock("sess_restart", i, i * 320, 1.0 + i * 0.02, pcm))
+
+    chunk = await asyncio.wait_for(worker.get_output_chunk(), timeout=1.0)
+    assert chunk is not None
+    assert isinstance(chunk, BroadcastAudioChunk)
+    assert chunk.sample_rate == 48000
+
+    await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_gemini_worker_live_subtasks_cleanup_on_stop(tmp_path):
+    queue = asyncio.Queue(maxsize=10)
+    log_file = str(tmp_path / "transcript_gemini.jsonl")
+
+    async def fake_receive():
+        while True:
+            await asyncio.sleep(0.5)
+            yield MagicMock()
+
+    mock_session = AsyncMock()
+    mock_session.receive = fake_receive
+    mock_session.send_realtime_input = AsyncMock()
+
+    class FakeLiveConnectContext:
+        async def __aenter__(self):
+            return mock_session
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.aio.live.connect.return_value = FakeLiveConnectContext()
+
+    with patch("google.genai.Client", return_value=mock_client):
+        worker = GeminiWorker(
+            queue_in=queue,
+            mode="live",
+            transcript_path=log_file,
+            api_key="fake-test-key",
+        )
+        spawned_tasks = []
+        original_create_task = asyncio.create_task
+
+        def spy_create_task(coro, *args, **kwargs):
+            task = original_create_task(coro, *args, **kwargs)
+            if kwargs.get("name") in ("gemini_live_sender", "gemini_live_receiver"):
+                spawned_tasks.append(task)
+            return task
+
+        with patch("asyncio.create_task", side_effect=spy_create_task):
+            await worker.start()
+
+            # Allow live loop to connect and spawn sender/receiver subtasks
+            await asyncio.sleep(0.05)
+
+            assert len(spawned_tasks) == 2
+            assert all(not t.done() for t in spawned_tasks)
+
+            # Stop worker, cancelling _live_loop which must cancel and await subtasks
+            await worker.stop()
+
+            # Both subtasks must now be cancelled and done
+            assert len(spawned_tasks) == 2
+            for t in spawned_tasks:
+                assert t.done()
+                assert t.cancelled()
+
+

@@ -78,6 +78,8 @@ class GeminiWorker(BaseWorker):
         if self._worker_task is not None and not self._worker_task.done():
             return
         self._stopped = False
+        # Reset output queue to clear any leftover sentinel/None from previous stop()
+        self._queue_out = asyncio.Queue(maxsize=self.queue_out_size)
         self._state.status = "READY"
         if self.mode == "mock":
             self._worker_task = asyncio.create_task(self._mock_loop())
@@ -242,28 +244,31 @@ class GeminiWorker(BaseWorker):
                     self._state.error_message = None
 
                     sender_task = asyncio.create_task(
-                        self._live_sender(session, types)
+                        self._live_sender(session, types),
+                        name="gemini_live_sender",
                     )
                     receiver_task = asyncio.create_task(
-                        self._live_receiver(session)
+                        self._live_receiver(session),
+                        name="gemini_live_receiver",
                     )
 
-                    done, pending = await asyncio.wait(
-                        [sender_task, receiver_task],
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-
-                    for task in pending:
-                        task.cancel()
-                        try:
-                            await task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-
-                    for task in done:
-                        exc = task.exception()
-                        if exc and not isinstance(exc, asyncio.CancelledError):
-                            raise exc
+                    try:
+                        done, pending = await asyncio.wait(
+                            [sender_task, receiver_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in done:
+                            exc = task.exception()
+                            if exc and not isinstance(exc, asyncio.CancelledError):
+                                raise exc
+                    finally:
+                        for task in (sender_task, receiver_task):
+                            if not task.done():
+                                task.cancel()
+                                try:
+                                    await task
+                                except (asyncio.CancelledError, Exception):
+                                    pass
 
             except asyncio.CancelledError:
                 break
