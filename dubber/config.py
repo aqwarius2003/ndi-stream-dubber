@@ -3,8 +3,6 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 from dotenv import load_dotenv
 
-load_dotenv()
-
 @dataclass
 class DubberConfig:
     source_type: Literal["wav", "ndi"] = "wav"
@@ -26,14 +24,15 @@ class DubberConfig:
 
     @classmethod
     def from_env(cls) -> "DubberConfig":
+        load_dotenv()
         return cls(
             source_type=os.getenv("DUBBER_SOURCE_TYPE", "wav"),  # type: ignore
             provider_mode=os.getenv("DUBBER_PROVIDER_MODE", "mock"),  # type: ignore
             wav_file_path=os.getenv("DUBBER_WAV_FILE", "data/test_speech_ru.wav"),
-            ndi_source_name=os.getenv("DUBBER_NDI_SOURCE_NAME"),
+            ndi_source_name=os.getenv("DUBBER_NDI_SOURCE_NAME") or None,
             ndi_sink_name=os.getenv("DUBBER_NDI_SINK_NAME", "Dub_EN"),
-            gemini_api_key=os.getenv("GEMINI_API_KEY"),
-            soniox_api_key=os.getenv("SONIOX_API_KEY"),
+            gemini_api_key=os.getenv("GEMINI_API_KEY") or None,
+            soniox_api_key=os.getenv("SONIOX_API_KEY") or None,
             state_file_path=os.getenv("DUBBER_STATE_FILE", "state.json"),
             http_port=int(os.getenv("DUBBER_HTTP_PORT", "8000")),
             http_host=os.getenv("DUBBER_HTTP_HOST", "127.0.0.1"),

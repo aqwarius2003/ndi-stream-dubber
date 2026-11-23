@@ -26,3 +26,14 @@ def test_config_from_env(monkeypatch):
     assert config.gemini_api_key == "test_gemini_key"
     assert config.soniox_api_key == "test_soniox_key"
     assert config.ndi_source_name == "vMix_Feed"
+
+def test_config_from_env_empty_keys(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("SONIOX_API_KEY", "")
+    monkeypatch.setenv("DUBBER_NDI_SOURCE_NAME", "")
+    
+    config = DubberConfig.from_env()
+    assert config.gemini_api_key is None
+    assert config.soniox_api_key is None
+    assert config.ndi_source_name is None
+
