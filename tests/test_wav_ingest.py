@@ -1,3 +1,4 @@
+import asyncio
 import io
 import time
 import wave
@@ -146,3 +147,60 @@ async def test_wav_audio_source_realtime_pacing(tmp_path):
     # Pacing for 3 blocks of 20ms: block 0 (t=0), block 1 (t=20ms), block 2 (t=40ms).
     # Total elapsed should be at least ~0.035s
     assert elapsed >= 0.035
+
+
+@pytest.mark.asyncio
+async def test_wav_audio_source_async_context_manager(tmp_path):
+    wav_path = tmp_path / "test_ctx.wav"
+    wav_path.write_bytes(create_synthetic_wav(duration_s=0.1, sample_rate=16000, channels=1))
+
+    async with WAVAudioSource(file_path=str(wav_path), session_id="ctx_sess", real_time_pace=False) as source:
+        block = await source.read_block()
+        assert block is not None
+        assert block.block_index == 0
+
+    # Outside context manager, source is stopped and read_block returns None
+    assert await source.read_block() is None
+
+
+@pytest.mark.asyncio
+async def test_wav_audio_source_stop_while_sleeping(tmp_path):
+    wav_path = tmp_path / "test_stop_sleep.wav"
+    # 1.0s = 50 blocks
+    wav_path.write_bytes(create_synthetic_wav(duration_s=1.0, sample_rate=16000, channels=1))
+
+    source = WAVAudioSource(file_path=str(wav_path), real_time_pace=True)
+    await source.start()
+
+    # Read first block
+    blk1 = await source.read_block()
+    assert blk1 is not None
+
+    # Spawn read_block in background, and stop source concurrently while it's sleeping
+    read_task = asyncio.create_task(source.read_block())
+    await asyncio.sleep(0.005)
+    await source.stop()
+    blk2 = await read_task
+    assert blk2 is None
+
+
+@pytest.mark.asyncio
+async def test_wav_audio_source_startup_delay_no_burst(tmp_path):
+    wav_path = tmp_path / "test_delay.wav"
+    wav_path.write_bytes(create_synthetic_wav(duration_s=0.1, sample_rate=16000, channels=1))
+
+    source = WAVAudioSource(file_path=str(wav_path), real_time_pace=True)
+    await source.start()
+
+    # Simulate consumer delay before first read
+    await asyncio.sleep(0.05)
+
+    t0 = time.monotonic()
+    blk0 = await source.read_block()
+    assert blk0 is not None
+    # Next block should wait ~20ms from first read, not burst immediately
+    blk1 = await source.read_block()
+    elapsed = time.monotonic() - t0
+    assert blk1 is not None
+    assert elapsed >= 0.015
+    await source.stop()

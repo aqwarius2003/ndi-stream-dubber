@@ -12,6 +12,33 @@ from dubber.ingest.base import AudioSource
 from dubber.types import AudioBlock
 
 
+def _load_and_resample(file_path: str) -> np.ndarray:
+    """Read a WAV file and resample/downmix to 16 kHz mono 16-bit PCM."""
+    with wave.open(file_path, "rb") as wf:
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        orig_sr = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+
+    if sample_width != 2:
+        raise ValueError(f"Only 16-bit PCM WAV is supported, got sample width {sample_width}")
+
+    raw_samples = np.frombuffer(frames, dtype=np.int16)
+    if channels > 1:
+        raw_samples = raw_samples.reshape(-1, channels)
+        raw_samples = np.mean(raw_samples, axis=1).astype(np.int16)
+
+    if orig_sr != 16000:
+        # Resample to 16000 Hz using rational fraction resample_poly
+        g = gcd(orig_sr, 16000)
+        up = 16000 // g
+        down = orig_sr // g
+        resampled = resample_poly(raw_samples.astype(np.float32), up, down)
+        return np.clip(resampled, -32768, 32767).astype(np.int16)
+
+    return raw_samples
+
+
 class WAVAudioSource(AudioSource):
     """Reads a WAV file, converts to 16 kHz mono 16-bit PCM, and yields 20 ms AudioBlocks."""
 
@@ -33,35 +60,12 @@ class WAVAudioSource(AudioSource):
         self._block_samples = 320  # 20 ms at 16 kHz (320 samples * 2 bytes = 640 bytes)
 
     async def start(self) -> None:
-        with wave.open(self.file_path, "rb") as wf:
-            channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            orig_sr = wf.getframerate()
-            frames = wf.readframes(wf.getnframes())
-
-        if sample_width != 2:
-            raise ValueError(f"Only 16-bit PCM WAV is supported, got sample width {sample_width}")
-
-        raw_samples = np.frombuffer(frames, dtype=np.int16)
-        if channels > 1:
-            raw_samples = raw_samples.reshape(-1, channels)
-            raw_samples = np.mean(raw_samples, axis=1).astype(np.int16)
-
-        if orig_sr != 16000:
-            # Resample to 16000 Hz using rational fraction resample_poly
-            g = gcd(orig_sr, 16000)
-            up = 16000 // g
-            down = orig_sr // g
-            resampled = resample_poly(raw_samples.astype(np.float32), up, down)
-            self._audio_data_16k = np.clip(resampled, -32768, 32767).astype(np.int16)
-        else:
-            self._audio_data_16k = raw_samples
-
+        self._audio_data_16k = await asyncio.to_thread(_load_and_resample, self.file_path)
         self._current_pos = 0
         self._block_index = 0
         self._sample_offset = 0
         self._running = True
-        self._start_time = time.monotonic()
+        self._start_time = 0.0
 
     async def stop(self) -> None:
         self._running = False
@@ -75,6 +79,9 @@ class WAVAudioSource(AudioSource):
             self._running = False
             return None
 
+        if self._start_time == 0.0:
+            self._start_time = time.monotonic()
+
         # Real-time pacing with drift compensation against monotonic clock
         if self.real_time_pace:
             expected_time = self._start_time + (self._sample_offset / 16000.0)
@@ -82,6 +89,8 @@ class WAVAudioSource(AudioSource):
             wait_time = expected_time - now
             if wait_time > 0.001:
                 await asyncio.sleep(wait_time)
+                if not self._running:
+                    return None
 
         chunk = self._audio_data_16k[self._current_pos : self._current_pos + self._block_samples]
         block = AudioBlock(

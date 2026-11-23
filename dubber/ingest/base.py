@@ -1,6 +1,8 @@
 """Abstract Base Class for audio ingest sources."""
 
 from abc import ABC, abstractmethod
+from types import TracebackType
+from typing import Self
 
 from dubber.types import AudioBlock
 
@@ -25,3 +27,15 @@ class AudioSource(ABC):
         Returns None when EOF is reached or the source is stopped.
         """
         ...
+
+    async def __aenter__(self) -> Self:
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        await self.stop()
