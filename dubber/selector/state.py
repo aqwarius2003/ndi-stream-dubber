@@ -27,16 +27,33 @@ class SelectorState:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], default_branch: BranchType = "gemini") -> "SelectorState":
+    def from_dict(cls, data: Any, default_branch: BranchType = "gemini") -> "SelectorState":
         """Reconstruct state from dictionary."""
+        if not isinstance(data, dict):
+            return cls(active_branch=default_branch)
+
         active = data.get("active_branch", default_branch)
         if active not in ("gemini", "soniox"):
             active = default_branch
+
+        try:
+            last_switch_time = float(data.get("last_switch_time", 0.0))
+        except (TypeError, ValueError):
+            last_switch_time = 0.0
+
+        try:
+            switch_count = int(data.get("switch_count", 0))
+        except (TypeError, ValueError):
+            switch_count = 0
+
+        raw_meta = data.get("metadata")
+        metadata = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+
         return cls(
             active_branch=active,
-            last_switch_time=float(data.get("last_switch_time", 0.0)),
-            switch_count=int(data.get("switch_count", 0)),
-            metadata=dict(data.get("metadata", {})),
+            last_switch_time=last_switch_time,
+            switch_count=switch_count,
+            metadata=metadata,
         )
 
     def save(self, file_path: str | Path) -> None:
@@ -73,6 +90,6 @@ class SelectorState:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return cls.from_dict(data, default_branch=default_branch)
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError) as e:
             logger.warning("Failed to load selector state from %s (%s). Using default.", path, e)
             return cls(active_branch=default_branch)

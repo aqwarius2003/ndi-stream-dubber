@@ -4,6 +4,7 @@ Enforces zero-auto-fallback, target freshness gates, and crossfades on switches.
 """
 
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -24,6 +25,7 @@ class DubSelector:
     - Freshness check on switch: Target branch must be READY/RUNNING and fresh (<= 0.5s).
     - Crossfade: 15 ms crossfade (720 samples at 48 kHz) to prevent acoustic clicks on transition.
     - Persistent state: Remembers active selection across restarts in state.json.
+    - Thread-safety: Thread-safe locks across operator controls and audio pipeline.
     """
 
     def __init__(
@@ -41,6 +43,9 @@ class DubSelector:
         self.crossfade_ms: int = crossfade_ms
         self.sample_rate: int = sample_rate
         self.channels: int = channels
+
+        # Thread safety lock
+        self._lock = threading.RLock()
 
         # Crossfade duration in frames
         self.crossfade_samples: int = int(sample_rate * (crossfade_ms / 1000.0))
@@ -66,27 +71,31 @@ class DubSelector:
     @property
     def active_branch(self) -> BranchType:
         """Currently active broadcast branch."""
-        return self._state.active_branch
+        with self._lock:
+            return self._state.active_branch
 
     def update_branch_state(self, state: BranchState) -> None:
         """Update monitored status of a translation branch."""
-        self._branch_states[state.branch] = state
+        with self._lock:
+            self._branch_states[state.branch] = state
 
     def get_branch_state(self, branch: BranchType) -> BranchState:
         """Get the latest recorded state of a branch."""
-        if branch not in self._branch_states:
-            self._branch_states[branch] = BranchState(branch=branch, status="STARTING")
-        return self._branch_states[branch]
+        with self._lock:
+            if branch not in self._branch_states:
+                self._branch_states[branch] = BranchState(branch=branch, status="STARTING")
+            return self._branch_states[branch]
 
     def is_alert_active(self) -> bool:
         """Return True if the currently active branch is in an error or failed state.
 
         Zero auto-fallback rule: selector flags alert, but NEVER auto-switches.
         """
-        active_state = self.get_branch_state(self.active_branch)
-        if active_state.status in ("ERROR", "STALE", "STOPPED"):
-            return True
-        return bool(active_state.error_message)
+        with self._lock:
+            active_state = self.get_branch_state(self.active_branch)
+            if active_state.status in ("ERROR", "STALE", "STOPPED"):
+                return True
+            return bool(active_state.error_message)
 
     def switch_branch(self, target: BranchType, force: bool = False) -> tuple[bool, str]:
         """Switch the active broadcast branch to target.
@@ -102,55 +111,163 @@ class DubSelector:
         Returns:
             tuple[bool, str]: (Success flag, descriptive message).
         """
-        if target not in ("gemini", "soniox"):
-            return False, f"Unknown branch: '{target}'"
+        with self._lock:
+            if target not in ("gemini", "soniox"):
+                return False, f"Unknown branch: '{target}'"
 
-        old_branch = self._state.active_branch
-        if target == old_branch:
-            return True, f"Branch '{target}' is already active"
+            old_branch = self._state.active_branch
+            if target == old_branch:
+                return True, f"Branch '{target}' is already active"
 
-        target_state = self.get_branch_state(target)
+            target_state = self.get_branch_state(target)
 
-        if not force:
-            if target_state.status not in ("READY", "RUNNING"):
-                msg = f"Target branch '{target}' is NOT READY (status: {target_state.status})"
-                logger.warning("Rejected switch command: %s", msg)
-                return False, msg
+            if not force:
+                if target_state.status not in ("READY", "RUNNING"):
+                    msg = f"Target branch '{target}' is NOT READY (status: {target_state.status})"
+                    logger.warning("Rejected switch command: %s", msg)
+                    return False, msg
 
-            now = time.monotonic()
-            age = now - target_state.last_audio_time
-            if target_state.last_audio_time <= 0.0 or age > self.freshness_threshold_s:
-                msg = (
-                    f"Target branch '{target}' is NOT FRESH "
-                    f"(age: {age:.2f}s > {self.freshness_threshold_s:.2f}s)"
-                )
-                logger.warning("Rejected switch command: %s", msg)
-                return False, msg
+                now = time.monotonic()
+                age = now - target_state.last_audio_time
+                if target_state.last_audio_time <= 0.0 or age > self.freshness_threshold_s:
+                    msg = (
+                        f"Target branch '{target}' is NOT FRESH "
+                        f"(age: {age:.2f}s > {self.freshness_threshold_s:.2f}s)"
+                    )
+                    logger.warning("Rejected switch command: %s", msg)
+                    return False, msg
 
-        self._state.active_branch = target
-        self._state.last_switch_time = time.time()
-        self._state.switch_count += 1
-        self._save_state()
-        self._trigger_crossfade()
-        logger.info("Switched active branch from %s to %s", old_branch, target)
-        return True, f"Switched active branch from '{old_branch}' to '{target}'"
+            self._state.active_branch = target
+            self._state.last_switch_time = time.time()
+            self._state.switch_count += 1
+            self._save_state()
+            self._trigger_crossfade()
+            logger.info("Switched active branch from %s to %s", old_branch, target)
+            return True, f"Switched active branch from '{old_branch}' to '{target}'"
 
     def process_chunk(self, chunk: BroadcastAudioChunk) -> BroadcastAudioChunk | None:
         """Process an incoming audio chunk from a translation branch.
 
+        - Updates incoming branch timestamp and promotes STARTING to READY.
         - Discards chunks from non-active branches (returns None).
         - If active branch is failed (is_alert_active()), outputs silence.
         - Applies crossfade smoothing when switching between branches.
         """
-        # Discard audio from inactive branches
-        if chunk.source_branch != self.active_branch:
-            return None
+        with self._lock:
+            # Update incoming branch timestamp and status before filtering
+            src = chunk.source_branch
+            if src in self._branch_states:
+                b_state = self._branch_states[src]
+                b_state.last_audio_time = time.monotonic()
+                if b_state.status == "STARTING":
+                    b_state.status = "READY"
+            elif src in ("gemini", "soniox"):
+                self._branch_states[src] = BranchState(
+                    branch=src,
+                    status="READY",
+                    last_audio_time=time.monotonic(),
+                )
 
-        # Zero auto-fallback rule: active failure outputs silence
-        if self.is_alert_active():
-            silence_pcm = b"\x00" * len(chunk.pcm_data)
-            silence_len = min(self.crossfade_samples * self.channels, len(chunk.pcm_data) // 2)
-            self._last_tail = np.zeros(silence_len, dtype=np.int16)
+            # Discard audio from inactive branches
+            if chunk.source_branch != self.active_branch:
+                return None
+
+            # Align byte buffer to 16-bit multi-channel frame boundary
+            align_bytes = 2 * max(1, self.channels)
+            pcm_bytes = chunk.pcm_data
+            if len(pcm_bytes) % align_bytes != 0:
+                pcm_bytes = pcm_bytes[: len(pcm_bytes) - (len(pcm_bytes) % align_bytes)]
+
+            # Zero auto-fallback rule: active failure outputs silence
+            if self.is_alert_active():
+                silence_pcm = b"\x00" * len(pcm_bytes)
+                total_samples = len(pcm_bytes) // 2
+                if total_samples > 0:
+                    silence_len = min(self.crossfade_samples * self.channels, total_samples)
+                    self._last_tail = np.zeros(silence_len, dtype=np.int16)
+                return BroadcastAudioChunk(
+                    session_id=chunk.session_id,
+                    language=chunk.language,
+                    source_branch=chunk.source_branch,
+                    block_index=chunk.block_index,
+                    source_time=chunk.source_time,
+                    sample_rate=chunk.sample_rate,
+                    channels=chunk.channels,
+                    pcm_data=silence_pcm,
+                )
+
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16).copy()
+            total_samples = len(samples)
+
+            if total_samples == 0:
+                return BroadcastAudioChunk(
+                    session_id=chunk.session_id,
+                    language=chunk.language,
+                    source_branch=chunk.source_branch,
+                    block_index=chunk.block_index,
+                    source_time=chunk.source_time,
+                    sample_rate=chunk.sample_rate,
+                    channels=chunk.channels,
+                    pcm_data=b"",
+                )
+
+            if self._is_crossfading and self._fade_old_tail is not None and self.crossfade_samples > 0:
+                total_frames = total_samples // self.channels
+                remaining_frames = self.crossfade_samples - self._fade_pos
+                blend_frames = min(total_frames, remaining_frames)
+
+                if blend_frames > 0:
+                    k_start = self._fade_pos
+                    k_end = self._fade_pos + blend_frames - 1
+                    n = self.crossfade_samples
+
+                    if n > 1:
+                        weights = np.linspace(
+                            k_start / (n - 1),
+                            k_end / (n - 1),
+                            blend_frames,
+                            dtype=np.float32,
+                        )
+                    else:
+                        weights = np.ones(blend_frames, dtype=np.float32)
+
+                    if self.channels == 1:
+                        old_slice = self._fade_old_tail[k_start : k_start + blend_frames].astype(np.float32)
+                        new_slice = samples[:blend_frames].astype(np.float32)
+                        blended = np.clip(
+                            np.round((1.0 - weights) * old_slice + weights * new_slice),
+                            -32768,
+                            32767,
+                        ).astype(np.int16)
+                        samples[:blend_frames] = blended
+                    else:
+                        blend_samples = blend_frames * self.channels
+                        old_slice = self._fade_old_tail[
+                            k_start * self.channels : (k_start + blend_frames) * self.channels
+                        ].reshape(-1, self.channels).astype(np.float32)
+                        new_slice = samples[:blend_samples].reshape(-1, self.channels).astype(np.float32)
+                        w = weights[:, None]
+                        blended = np.clip(
+                            np.round((1.0 - w) * old_slice + w * new_slice),
+                            -32768,
+                            32767,
+                        ).astype(np.int16).reshape(-1)
+                        samples[:blend_samples] = blended
+
+                    self._fade_pos += blend_frames
+                    if self._fade_pos >= self.crossfade_samples:
+                        self._is_crossfading = False
+                        self._fade_old_tail = None
+                        self._fade_pos = 0
+
+            # Store tail of current output stream for future crossfades (do not overwrite if empty)
+            if total_samples > 0:
+                tail_samples = self.crossfade_samples * self.channels
+                if total_samples >= tail_samples:
+                    self._last_tail = samples[-tail_samples:].copy()
+                else:
+                    self._last_tail = samples.copy()
+
             return BroadcastAudioChunk(
                 session_id=chunk.session_id,
                 language=chunk.language,
@@ -159,78 +276,8 @@ class DubSelector:
                 source_time=chunk.source_time,
                 sample_rate=chunk.sample_rate,
                 channels=chunk.channels,
-                pcm_data=silence_pcm,
+                pcm_data=samples.tobytes(),
             )
-
-        samples = np.frombuffer(chunk.pcm_data, dtype=np.int16).copy()
-        total_samples = len(samples)
-
-        if self._is_crossfading and self._fade_old_tail is not None and self.crossfade_samples > 0:
-            total_frames = total_samples // self.channels
-            remaining_frames = self.crossfade_samples - self._fade_pos
-            blend_frames = min(total_frames, remaining_frames)
-
-            if blend_frames > 0:
-                k_start = self._fade_pos
-                k_end = self._fade_pos + blend_frames - 1
-                n = self.crossfade_samples
-
-                if n > 1:
-                    weights = np.linspace(
-                        k_start / (n - 1),
-                        k_end / (n - 1),
-                        blend_frames,
-                        dtype=np.float32,
-                    )
-                else:
-                    weights = np.ones(blend_frames, dtype=np.float32)
-
-                if self.channels == 1:
-                    old_slice = self._fade_old_tail[k_start : k_start + blend_frames].astype(np.float32)
-                    new_slice = samples[:blend_frames].astype(np.float32)
-                    blended = np.clip(
-                        np.round((1.0 - weights) * old_slice + weights * new_slice),
-                        -32768,
-                        32767,
-                    ).astype(np.int16)
-                    samples[:blend_frames] = blended
-                else:
-                    blend_samples = blend_frames * self.channels
-                    old_slice = self._fade_old_tail[
-                        k_start * self.channels : (k_start + blend_frames) * self.channels
-                    ].reshape(-1, self.channels).astype(np.float32)
-                    new_slice = samples[:blend_samples].reshape(-1, self.channels).astype(np.float32)
-                    w = weights[:, None]
-                    blended = np.clip(
-                        np.round((1.0 - w) * old_slice + w * new_slice),
-                        -32768,
-                        32767,
-                    ).astype(np.int16).reshape(-1)
-                    samples[:blend_samples] = blended
-
-                self._fade_pos += blend_frames
-                if self._fade_pos >= self.crossfade_samples:
-                    self._is_crossfading = False
-                    self._fade_old_tail = None
-                    self._fade_pos = 0
-
-        # Store tail of current output stream for future crossfades
-        tail_samples = self.crossfade_samples * self.channels
-        if total_samples >= tail_samples:
-            self._last_tail = samples[-tail_samples:].copy()
-        else:
-            self._last_tail = samples.copy()
-
-        return BroadcastAudioChunk(
-            session_id=chunk.session_id,
-            language=chunk.language,
-            source_branch=chunk.source_branch,
-            block_index=chunk.block_index,
-            source_time=chunk.source_time,
-            sample_rate=chunk.sample_rate,
-            channels=chunk.channels,
-            pcm_data=samples.tobytes(),
-        )
 
     def create_silence_chunk(
         self,

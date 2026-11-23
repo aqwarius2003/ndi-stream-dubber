@@ -216,3 +216,62 @@ def test_selector_state_direct(tmp_path):
     assert loaded.active_branch == "soniox"
     assert loaded.switch_count == 3
     assert loaded.metadata == {"key": "val"}
+
+
+@pytest.mark.parametrize("payload", ["[]", "null", '"some_string"', "123", "true"])
+def test_selector_state_load_non_dict_json(tmp_path, payload):
+    state_file = tmp_path / "nondict.json"
+    state_file.write_text(payload, encoding="utf-8")
+
+    state = SelectorState.load(state_file, default_branch="gemini")
+    assert state.active_branch == "gemini"
+    assert state.switch_count == 0
+    assert state.metadata == {}
+
+
+def test_process_chunk_updates_inactive_branch_freshness(tmp_path):
+    selector = DubSelector(default_branch="gemini")
+
+    # Initially soniox is STARTING and last_audio_time is 0.0
+    soniox_state = selector.get_branch_state("soniox")
+    assert soniox_state.status == "STARTING"
+    assert soniox_state.last_audio_time == 0.0
+
+    t_before = time.monotonic()
+    c_soniox = make_chunk("soniox", 0, t_before)
+    out = selector.process_chunk(c_soniox)
+    # Output must be None because soniox is inactive
+    assert out is None
+
+    # But its state must now be READY and fresh
+    soniox_state_after = selector.get_branch_state("soniox")
+    assert soniox_state_after.status == "READY"
+    assert soniox_state_after.last_audio_time >= t_before
+
+    # Operator should now be able to switch to soniox cleanly
+    ok, _ = selector.switch_branch("soniox")
+    assert ok is True
+    assert selector.active_branch == "soniox"
+
+
+def test_process_chunk_odd_bytes_and_empty_chunk(tmp_path):
+    selector = DubSelector(default_branch="gemini", crossfade_ms=15)
+
+    # 1. Chunk with DC offset 1000
+    c1 = make_chunk("gemini", 0, time.monotonic(), dc_value=1000, num_samples=960)
+    out1 = selector.process_chunk(c1)
+    assert out1 is not None
+
+    # 2. Empty chunk with 0 samples - should not wipe out _last_tail
+    c_empty = BroadcastAudioChunk("sess", "en", "gemini", 1, time.monotonic(), 48000, 1, b"")
+    out_empty = selector.process_chunk(c_empty)
+    assert out_empty is not None
+    assert len(out_empty.pcm_data) == 0
+
+    # 3. Odd-byte length chunk: 960 samples * 2 + 1 byte
+    odd_pcm = (np.ones(960, dtype=np.int16) * 1000).tobytes() + b"\xff"
+    c_odd = BroadcastAudioChunk("sess", "en", "gemini", 2, time.monotonic(), 48000, 1, odd_pcm)
+    out_odd = selector.process_chunk(c_odd)
+    assert out_odd is not None
+    # Must be trimmed to multiple of 2 bytes
+    assert len(out_odd.pcm_data) == 1920
