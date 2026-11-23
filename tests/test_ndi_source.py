@@ -1,6 +1,5 @@
 """Unit tests for NDIAudioSource ingest component."""
 
-import asyncio
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -353,4 +352,133 @@ async def test_ndi_empty_frames_ignored():
         assert block is not None
         assert len(block.pcm_data) == 640
         await source.stop()
+
+
+@pytest.mark.asyncio
+async def test_ndi_reset_state_on_start():
+    with patch("dubber.ingest.ndi_source.ndi") as mock_ndi:
+        mock_ndi.initialize.return_value = True
+        mock_find = MagicMock()
+        mock_ndi.find_create_v2.return_value = mock_find
+        mock_src = MagicMock()
+        mock_src.ndi_name = "RESET_TEST"
+        mock_ndi.find_get_current_sources.return_value = [mock_src]
+        mock_recv = MagicMock()
+        mock_ndi.recv_create_v3.return_value = mock_recv
+
+        source = NDIAudioSource(source_name="RESET_TEST")
+        # Manually dirty internal state
+        source._block_index = 42
+        source._sample_offset = 13440
+        source._pcm_buffer.extend(b"\x00" * 320)
+
+        await source.start()
+        assert source._block_index == 0
+        assert source._sample_offset == 0
+        assert len(source._pcm_buffer) == 0
+        await source.stop()
+
+
+@pytest.mark.asyncio
+async def test_ndi_stop_does_not_destroy_global_ndi():
+    with patch("dubber.ingest.ndi_source.ndi") as mock_ndi:
+        mock_ndi.initialize.return_value = True
+        mock_find = MagicMock()
+        mock_ndi.find_create_v2.return_value = mock_find
+        mock_src = MagicMock()
+        mock_src.ndi_name = "GLOBAL_TEST"
+        mock_ndi.find_get_current_sources.return_value = [mock_src]
+        mock_recv = MagicMock()
+        mock_ndi.recv_create_v3.return_value = mock_recv
+
+        source = NDIAudioSource(source_name="GLOBAL_TEST")
+        await source.start()
+        await source.stop()
+
+        mock_ndi.recv_destroy.assert_called_once_with(mock_recv)
+        # Verify ndi.destroy is NOT called
+        mock_ndi.destroy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ndi_capture_mode_cached():
+    with patch("dubber.ingest.ndi_source.ndi") as mock_ndi:
+        mock_ndi.FRAME_TYPE_AUDIO = 2
+        mock_ndi.FRAME_TYPE_NONE = 0
+        mock_ndi.initialize.return_value = True
+        mock_find = MagicMock()
+        mock_ndi.find_create_v2.return_value = mock_find
+        mock_src = MagicMock()
+        mock_src.ndi_name = "CACHE_TEST"
+        mock_ndi.find_get_current_sources.return_value = [mock_src]
+        mock_recv = MagicMock()
+        mock_ndi.recv_create_v3.return_value = mock_recv
+
+        audio_frame = MagicMock()
+        audio_frame.sample_rate = 16000
+        audio_frame.no_channels = 1
+        audio_frame.no_samples = 320
+        audio_frame.data = np.zeros(320, dtype=np.int16)
+
+        call_log = []
+
+        def recv_capture(*args, **kwargs):
+            call_log.append(args)
+            if len(args) == 5 and args[1] is None:
+                raise TypeError("Incompatible function arguments")
+            return (mock_ndi.FRAME_TYPE_AUDIO, None, audio_frame, None)
+
+        mock_ndi.recv_capture_v3.side_effect = recv_capture
+
+        source = NDIAudioSource(source_name="CACHE_TEST")
+        await source.start()
+        assert source._capture_mode is None
+
+        # First read triggers TypeError and caches 'pybind11'
+        block1 = await source.read_block()
+        assert block1 is not None
+        assert source._capture_mode == "pybind11"
+
+        # Second read uses 'pybind11' directly without TypeError
+        block2 = await source.read_block()
+        assert block2 is not None
+        # In call_log, after the first 5-arg failed attempt, all calls have len 5 with args[1]==50 (pybind11 call)
+        pybind11_calls = [c for c in call_log if c[1] == 50]
+        assert len(pybind11_calls) == 2
+
+        await source.stop()
+
+
+@pytest.mark.asyncio
+async def test_ndi_free_frame_on_processing_error():
+    with patch("dubber.ingest.ndi_source.ndi") as mock_ndi:
+        mock_ndi.FRAME_TYPE_AUDIO = 2
+        mock_ndi.FRAME_TYPE_NONE = 0
+        mock_ndi.initialize.return_value = True
+        mock_find = MagicMock()
+        mock_ndi.find_create_v2.return_value = mock_find
+        mock_src = MagicMock()
+        mock_src.ndi_name = "FREE_GUARD_TEST"
+        mock_ndi.find_get_current_sources.return_value = [mock_src]
+        mock_recv = MagicMock()
+        mock_ndi.recv_create_v3.return_value = mock_recv
+
+        audio_frame = MagicMock()
+        mock_ndi.AudioFrameV3.return_value = audio_frame
+        mock_ndi.recv_capture_v3.return_value = mock_ndi.FRAME_TYPE_AUDIO
+
+        source = NDIAudioSource(source_name="FREE_GUARD_TEST")
+        await source.start()
+
+        # Simulate exception during frame processing
+        with (
+            patch.object(source, "_process_frame_to_pcm16_16k", side_effect=ValueError("DSP Error")),
+            pytest.raises(ValueError, match="DSP Error"),
+        ):
+            await source.read_block()
+
+        # Verify free frame was still called via finally
+        mock_ndi.recv_free_audio_v3.assert_called_once_with(mock_recv, audio_frame)
+        await source.stop()
+
 

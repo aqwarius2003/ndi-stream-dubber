@@ -2,9 +2,9 @@
 
 import asyncio
 import logging
-from math import gcd
+import threading
 import time
-from typing import Optional
+from math import gcd
 
 import numpy as np
 from scipy.signal import resample_poly
@@ -28,7 +28,7 @@ class NDIAudioSource(AudioSource):
 
     def __init__(
         self,
-        source_name: Optional[str] = None,
+        source_name: str | None = None,
         session_id: str = "ndi_session",
     ) -> None:
         self.source_name = source_name
@@ -39,6 +39,14 @@ class NDIAudioSource(AudioSource):
         self._sample_offset = 0
         self._pcm_buffer = bytearray()
         self._block_bytes = 640  # 320 samples * 2 bytes (20 ms at 16 kHz)
+        self._lock = threading.Lock()
+        self._capture_mode: str | None = None
+
+    def _reset_state(self) -> None:
+        """Reset sequence counters and buffer for a new streaming session."""
+        self._block_index = 0
+        self._sample_offset = 0
+        self._pcm_buffer.clear()
 
     async def start(self) -> None:
         if ndi is None:
@@ -46,26 +54,37 @@ class NDIAudioSource(AudioSource):
         if not ndi.initialize():
             raise RuntimeError("Failed to initialize NDIlib.")
 
+        self._reset_state()
+        recv, target_name = await asyncio.to_thread(self._connect)
+        with self._lock:
+            self._recv = recv
+            self._running = True
+        logger.info("Connected NDIAudioSource to '%s'", target_name)
+
+    def _connect(self) -> tuple[object, str]:
+        """Synchronously discover and connect to target NDI source."""
         find = ndi.find_create_v2()
         if not find:
             raise RuntimeError("Failed to create NDI find instance.")
 
-        target_source = None
-        # Search for source if name given, or take first available
-        for _ in range(20):
-            ndi.find_wait_for_sources(find, 100)
-            sources = ndi.find_get_current_sources(find)
-            if sources:
-                if self.source_name:
-                    for s in sources:
-                        if self.source_name.lower() in s.ndi_name.lower():
-                            target_source = s
-                            break
-                else:
-                    target_source = sources[0]
-                if target_source:
-                    break
-        ndi.find_destroy(find)
+        try:
+            target_source = None
+            # Search for source if name given, or take first available
+            for _ in range(20):
+                ndi.find_wait_for_sources(find, 100)
+                sources = ndi.find_get_current_sources(find)
+                if sources:
+                    if self.source_name:
+                        for s in sources:
+                            if self.source_name.lower() in s.ndi_name.lower():
+                                target_source = s
+                                break
+                    else:
+                        target_source = sources[0]
+                    if target_source:
+                        break
+        finally:
+            ndi.find_destroy(find)
 
         if not target_source:
             raise RuntimeError(f"NDI source '{self.source_name or 'any'}' not found on the network.")
@@ -74,22 +93,20 @@ class NDIAudioSource(AudioSource):
         recv_create.source_to_connect_to = target_source
         recv_create.color_format = ndi.RECV_COLOR_FORMAT_BGRX_BGRA
         recv_create.bandwidth = ndi.RECV_BANDWIDTH_AUDIO_ONLY
-        self._recv = ndi.recv_create_v3(recv_create)
-        if not self._recv:
+        recv = ndi.recv_create_v3(recv_create)
+        if not recv:
             raise RuntimeError(f"Failed to connect to NDI source: {target_source.ndi_name}")
 
-        self._running = True
-        logger.info("Connected NDIAudioSource to '%s'", target_source.ndi_name)
+        return recv, target_source.ndi_name
 
     async def stop(self) -> None:
         self._running = False
-        if self._recv and ndi:
-            ndi.recv_destroy(self._recv)
-            self._recv = None
-            if hasattr(ndi, "destroy"):
-                ndi.destroy()
+        with self._lock:
+            if self._recv and ndi:
+                ndi.recv_destroy(self._recv)
+                self._recv = None
 
-    async def read_block(self) -> Optional[AudioBlock]:
+    async def read_block(self) -> AudioBlock | None:
         if not self._running or not self._recv:
             return None
 
@@ -102,10 +119,11 @@ class NDIAudioSource(AudioSource):
                 await asyncio.sleep(0.005)
                 continue
 
-            # Convert to 16 kHz mono PCM16
-            pcm_chunk = self._process_frame_to_pcm16_16k(audio_frame)
-            self._pcm_buffer.extend(pcm_chunk)
-            self._free_frame(audio_frame)
+            try:
+                pcm_chunk = self._process_frame_to_pcm16_16k(audio_frame)
+                self._pcm_buffer.extend(pcm_chunk)
+            finally:
+                self._free_frame(audio_frame)
 
         if len(self._pcm_buffer) >= self._block_bytes:
             data = bytes(self._pcm_buffer[: self._block_bytes])
@@ -125,29 +143,40 @@ class NDIAudioSource(AudioSource):
         return None
 
     def _capture_frame(self):
-        audio_frame = ndi.AudioFrameV3()
-        try:
-            res = ndi.recv_capture_v3(self._recv, None, audio_frame, None, 50)
-        except TypeError:
-            # Native pybind11 signature: (instance, timeout, want_video, want_audio, want_metadata)
-            res = ndi.recv_capture_v3(self._recv, 50, False, True, False)
+        with self._lock:
+            if not self._running or not self._recv or ndi is None:
+                return None
 
-        if isinstance(res, tuple):
-            frame_type = res[0]
-            if frame_type == ndi.FRAME_TYPE_AUDIO:
-                return res[2] if len(res) > 2 and res[2] is not None else audio_frame
-            return None
-        else:
-            if res == ndi.FRAME_TYPE_AUDIO:
-                return audio_frame
-            return None
+            audio_frame = ndi.AudioFrameV3()
+            if self._capture_mode == "pybind11":
+                res = ndi.recv_capture_v3(self._recv, 50, False, True, False)
+            elif self._capture_mode == "5args":
+                res = ndi.recv_capture_v3(self._recv, None, audio_frame, None, 50)
+            else:
+                try:
+                    res = ndi.recv_capture_v3(self._recv, None, audio_frame, None, 50)
+                    self._capture_mode = "5args"
+                except TypeError:
+                    res = ndi.recv_capture_v3(self._recv, 50, False, True, False)
+                    self._capture_mode = "pybind11"
+
+            if isinstance(res, tuple):
+                frame_type = res[0]
+                if frame_type == ndi.FRAME_TYPE_AUDIO:
+                    return res[2] if len(res) > 2 and res[2] is not None else audio_frame
+                return None
+            else:
+                if res == ndi.FRAME_TYPE_AUDIO:
+                    return audio_frame
+                return None
 
     def _free_frame(self, audio_frame) -> None:
-        if self._recv and ndi and hasattr(ndi, "recv_free_audio_v3"):
-            try:
-                ndi.recv_free_audio_v3(self._recv, audio_frame)
-            except Exception:
-                pass
+        with self._lock:
+            if self._recv and ndi and hasattr(ndi, "recv_free_audio_v3"):
+                try:
+                    ndi.recv_free_audio_v3(self._recv, audio_frame)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("recv_free_audio_v3 failed: %s", exc)
 
     def _process_frame_to_pcm16_16k(self, frame) -> bytes:
         data = getattr(frame, "data", None)
@@ -160,41 +189,40 @@ class NDIAudioSource(AudioSource):
         if data.size == 0:
             return b""
 
-        is_float_audio = np.issubdtype(data.dtype, np.floating)
+        # Normalize input to float32 in [-1.0, 1.0]
+        if np.issubdtype(data.dtype, np.floating):
+            data_f32 = data.astype(np.float32)
+        elif data.dtype == np.int16:
+            data_f32 = data.astype(np.float32) / 32768.0
+        elif data.dtype == np.int32:
+            data_f32 = data.astype(np.float32) / 2147483648.0
+        else:
+            data_f32 = data.astype(np.float32) / 32768.0
 
-        # Normalize channels to mono
+        # Downmix multi-channel to mono in Float32
         channels = getattr(frame, "no_channels", 1)
         if channels > 1:
-            if data.ndim == 2:
-                if data.shape[1] == channels:
-                    data = np.mean(data, axis=1)
-                elif data.shape[0] == channels:
-                    data = np.mean(data, axis=0)
+            if data_f32.ndim == 2:
+                if data_f32.shape[1] == channels:
+                    data_f32 = np.mean(data_f32, axis=1)
+                elif data_f32.shape[0] == channels:
+                    data_f32 = np.mean(data_f32, axis=0)
                 else:
-                    data = np.mean(data, axis=1)
-            elif data.ndim == 1:
-                data = data.reshape(-1, channels)
-                data = np.mean(data, axis=1)
-        elif data.ndim > 1:
-            data = data.squeeze()
+                    data_f32 = np.mean(data_f32, axis=1)
+            elif data_f32.ndim == 1:
+                data_f32 = data_f32.reshape(-1, channels)
+                data_f32 = np.mean(data_f32, axis=1)
+        elif data_f32.ndim > 1:
+            data_f32 = data_f32.squeeze()
 
-        # Convert float to int16 or clip existing integers
-        if is_float_audio:
-            data = (np.clip(data, -1.0, 1.0) * 32767.0).astype(np.int16)
-        elif data.dtype == np.int16:
-            data = data.astype(np.int16)
-        elif data.dtype == np.int32:
-            data = np.clip(data / 65536.0, -32768, 32767).astype(np.int16)
-        else:
-            data = np.clip(data, -32768, 32767).astype(np.int16)
-
-        # Resample to 16 kHz if necessary
+        # Resample in Float32 if necessary
         orig_sr = getattr(frame, "sample_rate", 16000)
-        if orig_sr != 16000 and len(data) > 0:
+        if orig_sr != 16000 and len(data_f32) > 0:
             g = gcd(orig_sr, 16000)
             up = 16000 // g
             down = orig_sr // g
-            resampled = resample_poly(data.astype(np.float32), up, down)
-            data = np.clip(resampled, -32768, 32767).astype(np.int16)
+            data_f32 = resample_poly(data_f32, up, down)
 
-        return data.tobytes()
+        # Single conversion to int16 at the end
+        data_i16 = np.clip(np.round(data_f32 * 32767.0), -32768, 32767).astype(np.int16)
+        return data_i16.tobytes()

@@ -1,6 +1,5 @@
-import os
-import pytest
 from dubber.config import DubberConfig
+
 
 def test_default_config():
     config = DubberConfig()

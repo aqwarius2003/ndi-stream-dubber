@@ -1,14 +1,16 @@
 import os
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal
+
 from dotenv import load_dotenv
+
 
 @dataclass
 class DubberConfig:
     source_type: Literal["wav", "ndi"] = "wav"
     provider_mode: Literal["mock", "live"] = "mock"
-    wav_file_path: Optional[str] = "data/test_speech_ru.wav"
-    ndi_source_name: Optional[str] = None
+    wav_file_path: str | None = "data/test_speech_ru.wav"
+    ndi_source_name: str | None = None
     ndi_sink_name: str = "Dub_EN"
     sample_rate_in: int = 16000
     sample_rate_out: int = 48000
@@ -16,8 +18,8 @@ class DubberConfig:
     max_queue_size: int = 100
     freshness_threshold_s: float = 0.5
     crossfade_ms: int = 15
-    gemini_api_key: Optional[str] = None
-    soniox_api_key: Optional[str] = None
+    gemini_api_key: str | None = None
+    soniox_api_key: str | None = None
     state_file_path: str = "state.json"
     http_port: int = 8000
     http_host: str = "127.0.0.1"
