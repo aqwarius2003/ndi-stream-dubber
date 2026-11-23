@@ -164,6 +164,111 @@ def test_sink_package_exports():
 
 
 @pytest.mark.asyncio
+async def test_wav_audio_sink_odd_byte_length_defense(tmp_path):
+    out_wav = tmp_path / "odd_bytes.wav"
+    async with WAVAudioSink(file_path=str(out_wav), sample_rate=48000, channels=1) as sink:
+        # 1920 bytes valid + 1 trailing odd byte = 1921 bytes
+        odd_pcm = (np.ones(960, dtype=np.int16) * 1000).tobytes() + b"\xff"
+        chunk_odd = BroadcastAudioChunk("sess_odd", "en", "gemini", 0, 100.0, 48000, 1, odd_pcm)
+        await sink.write_chunk(chunk_odd)
+
+        # Single byte (less than 1 frame)
+        chunk_single = BroadcastAudioChunk("sess_odd", "en", "gemini", 1, 100.02, 48000, 1, b"\x01")
+        await sink.write_chunk(chunk_single)
+
+    with wave.open(str(out_wav), "rb") as wf:
+        assert wf.getframerate() == 48000
+        assert wf.getnchannels() == 1
+        assert wf.getnframes() == 960
+
+
+@pytest.mark.asyncio
+async def test_ndi_audio_sink_odd_byte_length_defense():
+    with patch("dubber.sink.ndi_sink.ndi") as mock_ndi:
+        mock_ndi.initialize.return_value = True
+        mock_send = MagicMock()
+        mock_ndi.send_create.return_value = mock_send
+
+        sink = NDIAudioSink(sink_name="Dub_EN", sample_rate=48000)
+        await sink.start()
+
+        # 1920 bytes (960 samples) + 1 odd byte
+        odd_pcm = (np.ones(960, dtype=np.int16) * 1000).tobytes() + b"\xaa"
+        chunk_odd = BroadcastAudioChunk("sess", "en", "gemini", 0, 10.0, 48000, 1, odd_pcm)
+        await sink.write_chunk(chunk_odd)
+
+        assert mock_ndi.send_send_audio_v3.call_count == 1
+        _, frame = mock_ndi.send_send_audio_v3.call_args[0]
+        assert frame.no_samples == 960
+
+        # Sub-frame single byte
+        chunk_single = BroadcastAudioChunk("sess", "en", "gemini", 1, 10.02, 48000, 1, b"\x01")
+        await sink.write_chunk(chunk_single)
+        # Call count remains 1 (single byte ignored without crash)
+        assert mock_ndi.send_send_audio_v3.call_count == 1
+
+        await sink.stop()
+
+
+@pytest.mark.asyncio
+async def test_ndi_audio_sink_multichannel():
+    with patch("dubber.sink.ndi_sink.ndi") as mock_ndi:
+        mock_ndi.initialize.return_value = True
+        mock_send = MagicMock()
+        mock_ndi.send_create.return_value = mock_send
+
+        sink = NDIAudioSink(sink_name="Dub_Stereo", sample_rate=48000, channels=2)
+        await sink.start()
+
+        # 960 stereo frames = 1920 samples = 3840 bytes
+        left = np.ones(960, dtype=np.int16) * 500
+        right = np.ones(960, dtype=np.int16) * -500
+        stereo_interleaved = np.empty((960, 2), dtype=np.int16)
+        stereo_interleaved[:, 0] = left
+        stereo_interleaved[:, 1] = right
+        pcm_data = stereo_interleaved.tobytes()
+
+        chunk = BroadcastAudioChunk("sess", "en", "gemini", 0, 10.0, 48000, 2, pcm_data)
+        await sink.write_chunk(chunk)
+
+        assert mock_ndi.send_send_audio_v3.called
+        _, frame = mock_ndi.send_send_audio_v3.call_args[0]
+        assert frame.no_channels == 2
+        assert frame.no_samples == 960
+        assert frame.data.shape == (2, 960)
+        assert frame.data.flags["C_CONTIGUOUS"] is True
+        assert np.isclose(frame.data[0, 0], 500 / 32768.0)
+        assert np.isclose(frame.data[1, 0], -500 / 32768.0)
+
+        await sink.stop()
+
+
+@pytest.mark.asyncio
+async def test_ndi_audio_sink_reentrant_start():
+    with patch("dubber.sink.ndi_sink.ndi") as mock_ndi:
+        mock_ndi.initialize.return_value = True
+        mock_send1 = MagicMock(name="send1")
+        mock_send2 = MagicMock(name="send2")
+        mock_ndi.send_create.side_effect = [mock_send1, mock_send2]
+
+        sink = NDIAudioSink(sink_name="Dub_EN", sample_rate=48000)
+        await sink.start()
+        assert sink._send == mock_send1
+        assert not mock_ndi.send_destroy.called
+
+        # Second start() call should destroy previous sender before creating new one
+        await sink.start()
+        assert mock_ndi.send_destroy.call_count == 1
+        mock_ndi.send_destroy.assert_called_with(mock_send1)
+        assert sink._send == mock_send2
+
+        # Final stop() should destroy the second sender
+        await sink.stop()
+        assert mock_ndi.send_destroy.call_count == 2
+        mock_ndi.send_destroy.assert_called_with(mock_send2)
+
+
+@pytest.mark.asyncio
 async def test_ndi_audio_sink_real():
     try:
         import NDIlib as ndi

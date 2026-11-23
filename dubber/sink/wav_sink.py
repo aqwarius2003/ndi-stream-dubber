@@ -41,6 +41,14 @@ class WAVAudioSink(AudioSink):
         if not chunk.pcm_data:
             return
 
+        bytes_per_frame = 2 * (self.channels if self.channels > 0 else 1)
+        raw_bytes = chunk.pcm_data
+        rem = len(raw_bytes) % bytes_per_frame
+        if rem != 0:
+            raw_bytes = raw_bytes[:-rem]
+        if not raw_bytes:
+            return
+
         with self._lock:
             if self._wf is not None:
-                self._wf.writeframes(chunk.pcm_data)
+                self._wf.writeframes(raw_bytes)

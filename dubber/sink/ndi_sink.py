@@ -39,6 +39,10 @@ class NDIAudioSink(AudioSink):
             raise RuntimeError("Failed to initialize NDIlib.")
 
         with self._lock:
+            if self._send is not None and ndi is not None:
+                ndi.send_destroy(self._send)
+                self._send = None
+
             send_settings = ndi.SendCreate()
             send_settings.ndi_name = self.sink_name
             self._send = ndi.send_create(send_settings)
@@ -61,20 +65,28 @@ class NDIAudioSink(AudioSink):
         if not chunk.pcm_data:
             return
 
+        channels = chunk.channels if chunk.channels > 0 else self.channels
+        bytes_per_frame = 2 * channels
+        raw_bytes = chunk.pcm_data
+        rem = len(raw_bytes) % bytes_per_frame
+        if rem != 0:
+            raw_bytes = raw_bytes[:-rem]
+        if not raw_bytes:
+            return
+
         with self._lock:
             if not self._running or self._send is None or ndi is None:
                 return
 
-            samples_int16 = np.frombuffer(chunk.pcm_data, dtype=np.int16)
+            samples_int16 = np.frombuffer(raw_bytes, dtype=np.int16)
             if samples_int16.size == 0:
                 return
 
             # NDI expects Float32 normalized audio in [-1.0, 1.0]
-            samples_float32 = samples_int16.astype(np.float32) / 32767.0
+            samples_float32 = np.clip(samples_int16.astype(np.float32) / 32768.0, -1.0, 1.0)
 
-            channels = chunk.channels if chunk.channels > 0 else self.channels
             if channels > 1:
-                samples_2d = samples_float32.reshape(-1, channels).T
+                samples_2d = np.ascontiguousarray(samples_float32.reshape(-1, channels).T)
             else:
                 samples_2d = samples_float32.reshape(1, -1)
 
