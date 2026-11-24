@@ -39,6 +39,7 @@ def _get_branch_info(engine: DubberEngine, branch: BranchType, now: float) -> di
         "freshness_ms": freshness_ms,
         "last_transcript": st.last_transcript,
         "dropped_blocks": dropped,
+        "error_message": st.error_message,
     }
 
 

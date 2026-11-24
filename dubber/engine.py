@@ -21,6 +21,7 @@ from dubber.sink.base import AudioSink
 from dubber.types import AudioBlock, BranchType, BroadcastAudioChunk
 from dubber.workers.base import BaseWorker
 from dubber.workers.gemini_worker import GeminiWorker
+from dubber.workers.soniox_tts import SonioxStreamingTTS
 from dubber.workers.soniox_worker import SonioxWorker
 
 logger = logging.getLogger(__name__)
@@ -63,10 +64,22 @@ class DubberEngine:
             ) or asyncio.Queue(maxsize=self.config.max_queue_size)
         else:
             self.queue_soniox = asyncio.Queue(maxsize=self.config.max_queue_size)
+            tts_provider = None
+            if self.config.provider_mode == "live":
+                tts_provider = SonioxStreamingTTS(
+                    api_key=self.config.soniox_api_key,
+                    endpoint_url=self.config.soniox_tts_endpoint_url,
+                    model=self.config.soniox_tts_model,
+                    voice=self.config.soniox_tts_voice,
+                )
             self.soniox_worker = SonioxWorker(
                 queue_in=self.queue_soniox,
                 mode=self.config.provider_mode,
                 api_key=self.config.soniox_api_key,
+                tts_provider=tts_provider,
+                tts_endpoint_url=self.config.soniox_tts_endpoint_url,
+                tts_model=self.config.soniox_tts_model,
+                tts_voice=self.config.soniox_tts_voice,
             )
 
         # DubSelector managing zero auto-fallback routing and freshness
@@ -221,6 +234,8 @@ class DubberEngine:
                 if not self._running:
                     break
 
+                self._sync_worker_states_to_selector()
+
                 now = time.monotonic()
                 elapsed = now - self._last_sink_write_time
                 source_active = self.is_source_active
@@ -231,7 +246,9 @@ class DubberEngine:
                     and (source_active or alert_active)
                     and self.sink is not None
                 ):
-                    silence_chunk = self.selector.create_silence_chunk(duration_ms=20.0)
+                    silence_chunk = self.selector.create_silence_chunk(
+                        duration_ms=20.0, session_id="silence"
+                    )
                     async with self._sink_lock:
                         await self.sink.write_chunk(silence_chunk)
                         self._last_sink_write_time = time.monotonic()

@@ -99,6 +99,37 @@ def test_operator_api_force_switch(tmp_path):
     assert res_force.json()["active_branch"] == "soniox"
 
 
+def test_operator_api_reports_voice_error_and_preserves_route(tmp_path):
+    config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
+    engine = DubberEngine(config)
+    app = create_app(engine)
+    client = TestClient(app)
+
+    # Force switch to soniox
+    engine.selector.switch_branch("soniox", force=True)
+
+    # Simulate TTS error on soniox
+    engine.selector.update_branch_state(
+        BranchState(
+            "soniox",
+            status="RUNNING",
+            last_audio_time=time.monotonic() - 1.0,
+            last_transcript="Translated speech text",
+            error_message="TTS error: Connection reset by peer",
+        )
+    )
+
+    res = client.get("/status")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["active_branch"] == "soniox"
+    assert data["alert"] is True
+    soniox_info = data["branches"]["soniox"]
+    assert "error_message" in soniox_info
+    assert soniox_info["error_message"] == "TTS error: Connection reset by peer"
+    assert soniox_info["last_transcript"] == "Translated speech text"
+
+
 def test_operator_api_alert_reporting(tmp_path):
     config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
     engine = DubberEngine(config)

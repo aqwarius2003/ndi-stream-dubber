@@ -20,6 +20,9 @@ class DubberConfig:
     crossfade_ms: int = 15
     gemini_api_key: str | None = None
     soniox_api_key: str | None = None
+    soniox_tts_endpoint_url: str = "wss://tts-rt.soniox.com/tts-websocket"
+    soniox_tts_model: str = "tts-rt-v2"
+    soniox_tts_voice: str = "Adrian"
     state_file_path: str = "state.json"
     http_port: int = 8000
     http_host: str = "127.0.0.1"
@@ -35,6 +38,11 @@ class DubberConfig:
             ndi_sink_name=os.getenv("DUBBER_NDI_SINK_NAME", "Dub_EN"),
             gemini_api_key=os.getenv("GEMINI_API_KEY") or None,
             soniox_api_key=os.getenv("SONIOX_API_KEY") or None,
+            soniox_tts_endpoint_url=os.getenv(
+                "DUBBER_SONIOX_TTS_ENDPOINT_URL", "wss://tts-rt.soniox.com/tts-websocket"
+            ),
+            soniox_tts_model=os.getenv("DUBBER_SONIOX_TTS_MODEL", "tts-rt-v2"),
+            soniox_tts_voice=os.getenv("DUBBER_SONIOX_TTS_VOICE", "Adrian"),
             state_file_path=os.getenv("DUBBER_STATE_FILE", "state.json"),
             http_port=int(os.getenv("DUBBER_HTTP_PORT", "8000")),
             http_host=os.getenv("DUBBER_HTTP_HOST", "127.0.0.1"),

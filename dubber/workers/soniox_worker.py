@@ -41,6 +41,10 @@ class SonioxWorker(BaseWorker):
         reconnect_delay_s: float = 2.0,
         batch_size: int = 5,
         queue_out_size: int = 100,
+        tts_queue_size: int = 10,
+        tts_endpoint_url: str = "wss://tts-rt.soniox.com/tts-websocket",
+        tts_model: str = "tts-rt-v2",
+        tts_voice: str = "Adrian",
     ) -> None:
         self.queue_in: asyncio.Queue[AudioBlock] = queue_in
         self.mode: Literal["live", "mock"] = mode
@@ -55,6 +59,10 @@ class SonioxWorker(BaseWorker):
         self.reconnect_delay_s: float = reconnect_delay_s
         self.batch_size: int = batch_size
         self.queue_out_size: int = queue_out_size
+        self.tts_queue_size: int = tts_queue_size
+        self.tts_endpoint_url: str = tts_endpoint_url
+        self.tts_model: str = tts_model
+        self.tts_voice: str = tts_voice
 
         parent_dir = Path(self.transcript_path).parent
         if str(parent_dir) not in ("", "."):
@@ -63,6 +71,10 @@ class SonioxWorker(BaseWorker):
         self._queue_out: asyncio.Queue[BroadcastAudioChunk | None] = asyncio.Queue(
             maxsize=self.queue_out_size
         )
+        self._tts_queue: asyncio.Queue[tuple[str, int, float, float, str]] = (
+            asyncio.Queue(maxsize=self.tts_queue_size)
+        )
+        self._tts_dropped_count: int = 0
         self._state = BranchState(
             branch="soniox",
             status="STARTING",
@@ -75,6 +87,7 @@ class SonioxWorker(BaseWorker):
 
         self._stopped: bool = False
         self._worker_task: asyncio.Task[None] | None = None
+        self._tts_task: asyncio.Task[None] | None = None
         self._emission_tasks: set[asyncio.Task[None]] = set()
 
         self._current_session_id: str = "sess"
@@ -93,6 +106,8 @@ class SonioxWorker(BaseWorker):
             return
         self._stopped = False
         self._queue_out = asyncio.Queue(maxsize=self.queue_out_size)
+        self._tts_queue = asyncio.Queue(maxsize=self.tts_queue_size)
+        self._tts_dropped_count = 0
         self._emission_tasks.clear()
         self._sent_batches.clear()
         self._last_logged_transcript = ""
@@ -100,6 +115,9 @@ class SonioxWorker(BaseWorker):
         if self.mode == "mock":
             self._worker_task = asyncio.create_task(self._mock_loop())
         else:
+            self._tts_task = asyncio.create_task(
+                self._live_tts_consumer(), name="soniox_live_tts_consumer"
+            )
             self._worker_task = asyncio.create_task(self._live_loop())
 
     async def stop(self) -> None:
@@ -117,6 +135,16 @@ class SonioxWorker(BaseWorker):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Error stopping SonioxWorker task: %s", exc)
             self._worker_task = None
+
+        if self._tts_task is not None:
+            self._tts_task.cancel()
+            try:
+                await self._tts_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error stopping SonioxWorker TTS task: %s", exc)
+            self._tts_task = None
 
         for task in list(self._emission_tasks):
             if not task.done():
@@ -482,29 +510,6 @@ class SonioxWorker(BaseWorker):
             if not tts_text:
                 continue
 
-            # 2. Streaming TTS synthesis
-            try:
-                if self.tts_provider is not None:
-                    res = self.tts_provider(tts_text)
-                    if inspect.isawaitable(res):
-                        pcm_48k = await res
-                    else:
-                        pcm_48k = res
-                elif "pcm_data" in data and isinstance(data["pcm_data"], bytes):
-                    pcm_48k = data["pcm_data"]
-                else:
-                    # Default synthesized 48 kHz mono audio (100 ms)
-                    pcm_48k = np.zeros(4800, dtype=np.int16).tobytes()
-            except Exception as tts_exc:  # noqa: BLE001
-                logger.error("Soniox live TTS synthesis error: %s", tts_exc)
-                self._state.status = "ERROR"
-                self._state.error_message = f"TTS error: {tts_exc}"
-                continue
-
-            if not isinstance(pcm_48k, bytes) or len(pcm_48k) == 0:
-                continue
-
-            now = time.monotonic()
             if self._sent_batches:
                 (
                     session_id,
@@ -512,43 +517,128 @@ class SonioxWorker(BaseWorker):
                     source_time,
                     send_time,
                 ) = self._sent_batches.popleft()
-                latency_s = max(0.0, now - send_time)
-            else:
-                session_id = self._current_session_id or "session"
-                block_index = self._current_block_index
-                source_time = self._current_source_time
-                latency_s = (
-                    max(0.0, now - self._last_send_time)
-                    if self._last_send_time > 0
-                    else 0.0
-                )
 
-            self._state.status = "RUNNING"
-            self._state.last_audio_time = now
-            self._state.latency_s = latency_s
-
-            chunk = BroadcastAudioChunk(
-                session_id=session_id,
-                language=self.target_language,
-                source_branch="soniox",
-                block_index=block_index,
-                source_time=source_time,
-                sample_rate=48000,
-                channels=1,
-                pcm_data=pcm_48k,
-            )
-
-            if self._queue_out.full():
+            # 2. Queue for decoupled TTS synthesis without blocking STT receiver
+            item = (session_id, block_index, source_time, send_time, tts_text)
+            if self._tts_queue.full():
                 try:
-                    dropped = self._queue_out.get_nowait()
-                    if dropped is not None:
-                        logger.warning(
-                            "SonioxWorker discarded block %d", dropped.block_index
-                        )
-                    self._state.dropped_blocks_count += 1
+                    self._tts_queue.get_nowait()
+                    self._tts_dropped_count += 1
+                    self._state.error_message = (
+                        f"TTS queue overflow ({self._tts_dropped_count} dropped)"
+                    )
+                    logger.warning(
+                        "SonioxWorker TTS queue full; dropped oldest translation to preserve real-time pace"
+                    )
                 except asyncio.QueueEmpty:
                     pass
-            await self._queue_out.put(chunk)
+
+            try:
+                self._tts_queue.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
+
+    async def _live_tts_consumer(self) -> None:
+        """Background task synthesizing queued translation texts into streaming audio."""
+        while not self._stopped:
+            try:
+                item = await self._tts_queue.get()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Error reading from TTS queue: %s", exc)
+                continue
+
+            session_id, block_index, source_time, send_time, tts_text = item
+            try:
+                provider = self.tts_provider
+                if provider is None:
+                    pcm_48k = np.zeros(4800, dtype=np.int16).tobytes()
+                    await self._emit_live_pcm_chunk(
+                        session_id, block_index, source_time, send_time, pcm_48k
+                    )
+                    continue
+
+                if hasattr(provider, "synthesize_stream"):
+                    async for pcm_chunk in provider.synthesize_stream(tts_text):
+                        if self._stopped:
+                            break
+                        if pcm_chunk:
+                            await self._emit_live_pcm_chunk(
+                                session_id, block_index, source_time, send_time, pcm_chunk
+                            )
+                elif inspect.isasyncgenfunction(provider):
+                    async for pcm_chunk in provider(tts_text):
+                        if self._stopped:
+                            break
+                        if pcm_chunk:
+                            await self._emit_live_pcm_chunk(
+                                session_id, block_index, source_time, send_time, pcm_chunk
+                            )
+                else:
+                    res = provider(tts_text)
+                    if inspect.isasyncgen(res):
+                        async for pcm_chunk in res:
+                            if self._stopped:
+                                break
+                            if pcm_chunk:
+                                await self._emit_live_pcm_chunk(
+                                    session_id, block_index, source_time, send_time, pcm_chunk
+                                )
+                    else:
+                        if inspect.isawaitable(res):
+                            pcm_chunk = await res
+                        else:
+                            pcm_chunk = res
+                        if isinstance(pcm_chunk, bytes) and len(pcm_chunk) > 0:
+                            await self._emit_live_pcm_chunk(
+                                session_id, block_index, source_time, send_time, pcm_chunk
+                            )
+            except asyncio.CancelledError:
+                break
+            except Exception as tts_exc:  # noqa: BLE001
+                logger.error("Soniox live TTS synthesis error: %s", tts_exc)
+                self._state.error_message = f"TTS error: {tts_exc}"
+
+    async def _emit_live_pcm_chunk(
+        self,
+        session_id: str,
+        block_index: int,
+        source_time: float,
+        send_time: float,
+        pcm_data: bytes,
+    ) -> None:
+        """Deliver a synthesized PCM chunk to the output queue and update latency/freshness."""
+        now = time.monotonic()
+        latency_s = max(0.0, now - send_time) if send_time > 0 else 0.0
+        self._state.status = "RUNNING"
+        self._state.last_audio_time = now
+        self._state.latency_s = latency_s
+        if self._state.error_message and self._state.error_message.startswith("TTS"):
+            self._state.error_message = None
+
+        chunk = BroadcastAudioChunk(
+            session_id=session_id,
+            language=self.target_language,
+            source_branch="soniox",
+            block_index=block_index,
+            source_time=source_time,
+            sample_rate=48000,
+            channels=1,
+            pcm_data=pcm_data,
+        )
+
+        if self._queue_out.full():
+            try:
+                dropped = self._queue_out.get_nowait()
+                if dropped is not None:
+                    logger.warning(
+                        "SonioxWorker discarded block %d", dropped.block_index
+                    )
+                self._state.dropped_blocks_count += 1
+            except asyncio.QueueEmpty:
+                pass
+        await self._queue_out.put(chunk)
 
     async def _drain_queue_during_error(self, duration: float) -> None:
         """Discard incoming blocks during error/reconnection to avoid stale queues."""

@@ -111,11 +111,15 @@ def generate_dashboard(engine: DubberEngine, last_action_msg: str = "") -> Layou
         else:
             status_color = "red"
 
+        status_display = f"[{status_color}]{st.status}[/{status_color}]"
+        if st.error_message:
+            status_display += f" [red]({escape(st.error_message[:35])})[/red]"
+
         transcript_display = escape(st.last_transcript[:60]) if st.last_transcript else "-"
 
         table.add_row(
             st.branch.capitalize(),
-            f"[{status_color}]{st.status}[/{status_color}]",
+            status_display,
             f"{st.latency_s:.2f}s",
             freshness_str,
             str(dropped_count),
