@@ -1,11 +1,14 @@
 """Tests for operator HTTP API and Rich TUI dashboard."""
 
 import asyncio
+import sys
 import time
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
+import dubber.operator.cli as cli_mod
 from dubber.config import DubberConfig
 from dubber.engine import DubberEngine
 from dubber.operator import create_app, generate_dashboard, run_operator_tui
@@ -73,6 +76,29 @@ def test_operator_api_stale_and_invalid_switch(tmp_path):
     assert "already active" in res_same.json()["message"]
 
 
+def test_operator_api_force_switch(tmp_path):
+    config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
+    engine = DubberEngine(config)
+    app = create_app(engine)
+    client = TestClient(app)
+
+    # Set soniox to stale state
+    engine.selector.update_branch_state(
+        BranchState("soniox", status="READY", last_audio_time=time.monotonic() - 10.0)
+    )
+
+    # Normal switch fails because branch is stale
+    res_stale = client.post("/switch/soniox")
+    assert res_stale.status_code == 400
+    assert "REJECTED" in res_stale.json()["detail"]
+
+    # Force switch succeeds even though branch is stale, and normalizes casing/whitespace
+    res_force = client.post("/switch/  SONIOX  ?force=true")
+    assert res_force.status_code == 200
+    assert res_force.json()["success"] is True
+    assert res_force.json()["active_branch"] == "soniox"
+
+
 def test_operator_api_alert_reporting(tmp_path):
     config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
     engine = DubberEngine(config)
@@ -105,6 +131,47 @@ def test_generate_dashboard(tmp_path):
     assert layout_alert is not None
 
 
+def test_generate_dashboard_with_action_and_escape(tmp_path):
+    config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
+    engine = DubberEngine(config)
+    # Transcript with Rich markup brackets
+    engine.selector.update_branch_state(
+        BranchState("gemini", status="READY", last_transcript="[bold]Special medical term[/bold]")
+    )
+    layout = generate_dashboard(engine, last_action_msg="Switch to Gemini completed")
+    assert layout is not None
+
+
+def test_poll_key_handling(monkeypatch):
+    # Case 1: not a tty
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    assert cli_mod._poll_key() is None
+
+    # Case 2: isatty, mock msvcrt with key "1"
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    mock_msvcrt = MagicMock()
+    mock_msvcrt.kbhit.return_value = True
+    mock_msvcrt.getch.return_value = b"1"
+    monkeypatch.setitem(sys.modules, "msvcrt", mock_msvcrt)
+    assert cli_mod._poll_key() == "1"
+
+    # Case 3: mock msvcrt with key "2"
+    mock_msvcrt.getch.return_value = b"2"
+    assert cli_mod._poll_key() == "2"
+
+    # Case 4: mock msvcrt with "q"
+    mock_msvcrt.getch.return_value = b"q"
+    assert cli_mod._poll_key() == "q"
+
+    # Case 5: mock msvcrt with Ctrl+C "\x03"
+    mock_msvcrt.getch.return_value = b"\x03"
+    assert cli_mod._poll_key() == "\x03"
+
+    # Case 6: kbhit is False
+    mock_msvcrt.kbhit.return_value = False
+    assert cli_mod._poll_key() is None
+
+
 @pytest.mark.asyncio
 async def test_run_operator_tui_stop(tmp_path):
     config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
@@ -115,3 +182,31 @@ async def test_run_operator_tui_stop(tmp_path):
     await asyncio.sleep(0.05)
     stop_event.set()
     await task
+
+
+@pytest.mark.asyncio
+async def test_run_operator_tui_keypress_actions(monkeypatch, tmp_path):
+    config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
+    engine = DubberEngine(config)
+    # Make soniox ready and fresh
+    engine.selector.update_branch_state(
+        BranchState("soniox", status="READY", last_audio_time=time.monotonic())
+    )
+
+    keys = iter(["2", "1", "\x03"])
+    monkeypatch.setattr(cli_mod, "_poll_key", lambda: next(keys, None))
+
+    stop_event = asyncio.Event()
+    await run_operator_tui(engine, refresh_rate=100.0, stop_event=stop_event)
+    assert stop_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_run_operator_tui_q_key(monkeypatch, tmp_path):
+    config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
+    engine = DubberEngine(config)
+    monkeypatch.setattr(cli_mod, "_poll_key", lambda: "q")
+
+    stop_event = asyncio.Event()
+    await run_operator_tui(engine, refresh_rate=100.0, stop_event=stop_event)
+    assert stop_event.is_set()

@@ -64,7 +64,8 @@ def create_app(engine: DubberEngine) -> FastAPI:
 
         Rejects switch with HTTP 400 if target branch is stale or not ready.
         """
-        ok, msg = engine.selector.switch_branch(branch, force=force)  # type: ignore[arg-type]
+        target = branch.strip().lower()
+        ok, msg = engine.selector.switch_branch(target, force=force)  # type: ignore[arg-type]
         if not ok:
             detail = f"REJECTED: {msg}" if not msg.startswith("REJECTED") else msg
             raise HTTPException(status_code=400, detail=detail)

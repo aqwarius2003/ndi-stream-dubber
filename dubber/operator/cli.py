@@ -8,6 +8,7 @@ import time
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -26,12 +27,12 @@ def _poll_key() -> str | None:
         if msvcrt.kbhit():
             ch = msvcrt.getch()
             return ch.decode("utf-8", errors="ignore")
-    except (OSError, UnicodeDecodeError):
+    except (ImportError, OSError, UnicodeDecodeError):
         return None
     return None
 
 
-def generate_dashboard(engine: DubberEngine) -> Layout:
+def generate_dashboard(engine: DubberEngine, last_action_msg: str = "") -> Layout:
     """Generate a Rich Layout representing the live operator dashboard."""
     layout = Layout()
     layout.split_column(
@@ -74,7 +75,11 @@ def generate_dashboard(engine: DubberEngine) -> Layout:
             ):
                 st = w_st
 
-        age_ms = int((now - st.last_audio_time) * 1000) if st.last_audio_time > 0 else 9999
+        age_ms = (
+            max(0, int((now - st.last_audio_time) * 1000))
+            if st.last_audio_time > 0
+            else 9999
+        )
         freshness_str = f"{age_ms} ms" if st.last_audio_time > 0 else "N/A"
         dropped_count = max(engine.dropped_blocks.get(branch, 0), st.dropped_blocks_count)
 
@@ -85,18 +90,23 @@ def generate_dashboard(engine: DubberEngine) -> Layout:
         else:
             status_color = "red"
 
+        transcript_display = escape(st.last_transcript[:60]) if st.last_transcript else "-"
+
         table.add_row(
             st.branch.capitalize(),
             f"[{status_color}]{st.status}[/{status_color}]",
             f"{st.latency_s:.2f}s",
             freshness_str,
             str(dropped_count),
-            st.last_transcript[:60] if st.last_transcript else "-",
+            transcript_display,
         )
 
     layout["main"].update(table)
+    footer_text = "Commands: [1/g] Switch to Gemini | [2/s] Switch to Soniox | [q] Quit"
+    if last_action_msg:
+        footer_text += f" | {last_action_msg}"
     footer_panel = Panel(
-        "Commands: [1/g] Switch to Gemini | [2/s] Switch to Soniox | [q] Quit",
+        footer_text,
         style="white",
     )
     layout["footer"].update(footer_panel)
@@ -114,22 +124,29 @@ async def run_operator_tui(
         console = Console()
 
     delay = 1.0 / max(1.0, refresh_rate)
-    with Live(generate_dashboard(engine), refresh_per_second=refresh_rate, console=console) as live:
+    last_action_msg = ""
+    with Live(
+        generate_dashboard(engine, last_action_msg=last_action_msg),
+        refresh_per_second=refresh_rate,
+        console=console,
+    ) as live:
         try:
             while stop_event is None or not stop_event.is_set():
                 key = _poll_key()
                 if key:
                     k = key.lower()
                     if k in ("1", "g"):
-                        engine.selector.switch_branch("gemini")
+                        ok, msg = engine.selector.switch_branch("gemini")
+                        last_action_msg = f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]"
                     elif k in ("2", "s"):
-                        engine.selector.switch_branch("soniox")
-                    elif k == "q":
+                        ok, msg = engine.selector.switch_branch("soniox")
+                        last_action_msg = f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]"
+                    elif k in ("q", "\x03"):
                         if stop_event is not None:
                             stop_event.set()
                         break
 
-                live.update(generate_dashboard(engine))
+                live.update(generate_dashboard(engine, last_action_msg=last_action_msg))
                 await asyncio.sleep(delay)
         except asyncio.CancelledError:
             pass
