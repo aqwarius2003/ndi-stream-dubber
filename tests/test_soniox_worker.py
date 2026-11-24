@@ -405,3 +405,168 @@ async def test_soniox_worker_stop_and_empty_queue(tmp_path):
     assert worker.get_state().status == "STOPPED"
     chunk = await worker.get_output_chunk()
     assert chunk is None
+
+
+@pytest.mark.asyncio
+async def test_soniox_worker_live_non_final_tokens_not_sent_to_tts(tmp_path):
+    queue = asyncio.Queue(maxsize=10)
+    log_file = str(tmp_path / "transcript_soniox.jsonl")
+
+    tts_calls = []
+
+    async def fake_tts(text: str) -> bytes:
+        tts_calls.append(text)
+        return (np.zeros(4800, dtype=np.int16)).tobytes()
+
+    mock_ws = AsyncMock()
+
+    async def fake_recv():
+        # Step 1: Emit non-final token
+        yield json.dumps({
+            "tokens": [
+                {
+                    "text": "Partial clinical trial",
+                    "translation_status": "translation",
+                    "is_final": False,
+                }
+            ]
+        })
+        await asyncio.sleep(0.05)
+        # Step 2: Emit finalized token
+        yield json.dumps({
+            "tokens": [
+                {
+                    "text": "results confirmed",
+                    "translation_status": "translation",
+                    "is_final": True,
+                }
+            ]
+        })
+        while True:
+            await asyncio.sleep(0.1)
+
+    mock_ws.__aiter__.side_effect = fake_recv
+
+    class FakeWsConnectContext:
+        async def __aenter__(self):
+            return mock_ws
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    with patch("websockets.connect", return_value=FakeWsConnectContext()):
+        worker = SonioxWorker(
+            queue_in=queue,
+            mode="live",
+            transcript_path=log_file,
+            api_key="test-key",
+            tts_provider=fake_tts,
+        )
+        await worker.start()
+
+        # Send blocks
+        pcm = (np.zeros(320, dtype=np.int16)).tobytes()
+        for i in range(5):
+            await queue.put(AudioBlock("sess", i, i * 320, 1.0 + i * 0.02, pcm))
+
+        # Wait for chunk from finalized token
+        chunk = await asyncio.wait_for(worker.get_output_chunk(), timeout=1.0)
+        assert chunk is not None
+
+        # TTS must have been called ONLY with finalized token, NOT with non-final token
+        assert "Partial clinical trial" not in tts_calls
+        assert "results confirmed" in tts_calls
+
+        # But transcript logging logged both/interim
+        lines = Path(log_file).read_text(encoding="utf-8").splitlines()
+        logged_texts = [json.loads(line)["text"] for line in lines]
+        assert "Partial clinical trial" in logged_texts
+        assert "results confirmed" in logged_texts
+
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_soniox_worker_live_sent_batches_no_queue_drift(tmp_path):
+    queue = asyncio.Queue(maxsize=50)
+    log_file = str(tmp_path / "transcript_soniox.jsonl")
+
+    mock_ws = AsyncMock()
+
+    async def fake_recv():
+        # Wait a short while so sender has pushed multiple batches to _sent_batches
+        await asyncio.sleep(0.08)
+        yield json.dumps({
+            "tokens": [
+                {
+                    "text": "Sentence finished",
+                    "translation_status": "translation",
+                    "is_final": True,
+                }
+            ]
+        })
+        while True:
+            await asyncio.sleep(0.1)
+
+    mock_ws.__aiter__.side_effect = fake_recv
+
+    class FakeWsConnectContext:
+        async def __aenter__(self):
+            return mock_ws
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    with patch("websockets.connect", return_value=FakeWsConnectContext()):
+        worker = SonioxWorker(
+            queue_in=queue,
+            mode="live",
+            transcript_path=log_file,
+            api_key="test-key",
+            batch_size=2,
+        )
+        await worker.start()
+
+        # Send 10 blocks (5 batches) rapidly
+        pcm = (np.zeros(320, dtype=np.int16)).tobytes()
+        for i in range(10):
+            await queue.put(AudioBlock("sess", i, i * 320, 1.0 + i * 0.02, pcm))
+
+        chunk = await asyncio.wait_for(worker.get_output_chunk(), timeout=1.0)
+        assert chunk is not None
+
+        # Verify all intermediate batches up to receipt timestamp were drained; no drift remains
+        assert len(worker._sent_batches) == 0
+
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_soniox_worker_mock_empty_tts_returns_early(tmp_path):
+    queue = asyncio.Queue(maxsize=10)
+    log_file = str(tmp_path / "transcript_soniox.jsonl")
+
+    # tts_provider returns empty bytes or None
+    worker = SonioxWorker(
+        queue_in=queue,
+        mode="mock",
+        transcript_path=log_file,
+        simulated_stt_delay_s=0.01,
+        simulated_tts_delay_s=0.01,
+        tts_provider=lambda text: b"",
+    )
+    await worker.start()
+
+    pcm = (np.zeros(320, dtype=np.int16)).tobytes()
+    for i in range(5):
+        await queue.put(AudioBlock("sess", i, i * 320, 1.0 + i * 0.02, pcm))
+
+    # STT delay passes and transcript is logged
+    await asyncio.sleep(0.05)
+    lines = Path(log_file).read_text(encoding="utf-8").splitlines()
+    assert len(lines) >= 1
+
+    # But output chunk was NOT emitted because empty TTS returns early
+    assert worker._queue_out.empty()
+
+    await worker.stop()

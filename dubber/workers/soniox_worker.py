@@ -1,6 +1,7 @@
 """Soniox STT v6 + TTS translation worker for PharmaLive Dubber."""
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -262,7 +263,7 @@ class SonioxWorker(BaseWorker):
             if self.tts_provider is not None:
                 try:
                     res = self.tts_provider(mock_text)
-                    if asyncio.iscoroutine(res):
+                    if inspect.isawaitable(res):
                         tts_pcm = await res
                     else:
                         tts_pcm = res
@@ -277,6 +278,8 @@ class SonioxWorker(BaseWorker):
                             channels=1,
                             pcm_data=tts_pcm,
                         )
+                    else:
+                        return
                 except Exception as tts_exc:  # noqa: BLE001
                     logger.error("TTS synthesis failed in SonioxWorker: %s", tts_exc)
                     self._state.status = "ERROR"
@@ -318,7 +321,9 @@ class SonioxWorker(BaseWorker):
 
         while not self._stopped:
             try:
+                self._sent_batches.clear()
                 async with websockets.connect(self.endpoint_url) as ws:
+                    self._sent_batches.clear()
                     self._state.status = "READY"
                     self._state.error_message = None
 
@@ -368,6 +373,7 @@ class SonioxWorker(BaseWorker):
             except asyncio.CancelledError:
                 break
             except Exception as exc:  # noqa: BLE001
+                self._sent_batches.clear()
                 logger.warning("SonioxWorker live connection error: %s", exc)
                 self._state.status = "ERROR"
                 self._state.error_message = str(exc)
@@ -417,6 +423,7 @@ class SonioxWorker(BaseWorker):
                 continue
 
             text = ""
+            tts_text = ""
             if "tokens" in data and isinstance(data["tokens"], list):
                 translated_parts = [
                     t.get("text", "")
@@ -425,10 +432,23 @@ class SonioxWorker(BaseWorker):
                     or ("translation_status" not in t and t.get("text"))
                 ]
                 text = "".join(translated_parts).strip()
+
+                final_parts = [
+                    t.get("text", "")
+                    for t in data["tokens"]
+                    if (
+                        t.get("translation_status") == "translation"
+                        or ("translation_status" not in t and t.get("text"))
+                    )
+                    and t.get("is_final", True) is True
+                ]
+                tts_text = "".join(final_parts).strip()
             elif "text" in data:
                 text = str(data["text"]).strip()
+                tts_text = text if data.get("is_final", True) is True else ""
             elif "translation" in data:
                 text = str(data["translation"]).strip()
+                tts_text = text if data.get("is_final", True) is True else ""
 
             if not text:
                 continue
@@ -452,11 +472,15 @@ class SonioxWorker(BaseWorker):
                     text=text,
                 )
 
+            # Only finalized tokens are synthesized to avoid repeating/stuttering audio
+            if not tts_text:
+                continue
+
             # 2. Streaming TTS synthesis
             try:
                 if self.tts_provider is not None:
-                    res = self.tts_provider(text)
-                    if asyncio.iscoroutine(res):
+                    res = self.tts_provider(tts_text)
+                    if inspect.isawaitable(res):
                         pcm_48k = await res
                     else:
                         pcm_48k = res
@@ -482,6 +506,9 @@ class SonioxWorker(BaseWorker):
                     source_time,
                     send_time,
                 ) = self._sent_batches.popleft()
+                # Drain intermediate batches sent up to this sentence's receipt timestamp
+                while self._sent_batches and self._sent_batches[0][3] <= now:
+                    self._sent_batches.popleft()
                 latency_s = max(0.0, now - send_time)
             else:
                 session_id = self._current_session_id or "session"
