@@ -85,6 +85,7 @@ class SonioxWorker(BaseWorker):
 
         # Tracking sent batches for live mode correlation: (session_id, block_index, source_time, send_time)
         self._sent_batches: deque[tuple[str, int, float, float]] = deque(maxlen=500)
+        self._mock_sample_count: int = 0
 
     async def start(self) -> None:
         """Start worker background processing task."""
@@ -198,7 +199,12 @@ class SonioxWorker(BaseWorker):
                 if batch_duration_ms <= 0:
                     batch_duration_ms = 100.0
                 num_samples = int(48000 * (batch_duration_ms / 1000.0))
-                pcm_data = np.zeros(num_samples, dtype=np.int16).tobytes()
+                if num_samples > 0:
+                    t = (self._mock_sample_count + np.arange(num_samples, dtype=np.float32)) / 48000.0
+                    self._mock_sample_count += num_samples
+                    pcm_data = (np.sin(2.0 * np.pi * 500.0 * t) * (0.2 * 32767)).astype(np.int16).tobytes()
+                else:
+                    pcm_data = b""
 
                 mock_text = (
                     f"Mock translated speech for session {session_id} block {block_index}"
@@ -506,9 +512,6 @@ class SonioxWorker(BaseWorker):
                     source_time,
                     send_time,
                 ) = self._sent_batches.popleft()
-                # Drain intermediate batches sent up to this sentence's receipt timestamp
-                while self._sent_batches and self._sent_batches[0][3] <= now:
-                    self._sent_batches.popleft()
                 latency_s = max(0.0, now - send_time)
             else:
                 session_id = self._current_session_id or "session"

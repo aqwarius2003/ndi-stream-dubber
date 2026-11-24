@@ -439,4 +439,35 @@ async def test_gemini_worker_dropped_block_logging(tmp_path, caplog):
     await worker.stop()
 
 
+@pytest.mark.asyncio
+async def test_gemini_worker_mock_audible_tone(tmp_path):
+    """Verify GeminiWorker in mock mode emits an audible tone (~440 Hz, amplitude ~0.2*32767)."""
+    queue = asyncio.Queue(maxsize=10)
+    log_file = str(tmp_path / "transcript_gemini.jsonl")
+    worker = GeminiWorker(
+        queue_in=queue,
+        mode="mock",
+        transcript_path=log_file,
+        simulated_delay_s=0.01,
+        batch_size=1,
+    )
+    await worker.start()
+    try:
+        pcm = (np.zeros(320, dtype=np.int16)).tobytes()
+        await queue.put(AudioBlock("sess", 0, 0, 1.0, pcm))
+        chunk = await asyncio.wait_for(worker.get_output_chunk(), timeout=1.0)
+        assert chunk is not None
+        samples = np.frombuffer(chunk.pcm_data, dtype=np.int16)
+        assert len(samples) > 0
+        max_amp = np.max(np.abs(samples))
+        assert 5000 <= max_amp <= 7000
+
+        from dubber.measure.latency import detect_speech_start
+
+        onset = detect_speech_start(samples, sample_rate=48000, threshold=500.0)
+        assert onset >= 0.0
+    finally:
+        await worker.stop()
+
+
 

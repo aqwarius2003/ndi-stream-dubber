@@ -487,7 +487,7 @@ async def test_soniox_worker_live_non_final_tokens_not_sent_to_tts(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_soniox_worker_live_sent_batches_no_queue_drift(tmp_path):
+async def test_soniox_worker_live_sent_batches_single_batch_pop(tmp_path):
     queue = asyncio.Queue(maxsize=50)
     log_file = str(tmp_path / "transcript_soniox.jsonl")
 
@@ -535,8 +535,8 @@ async def test_soniox_worker_live_sent_batches_no_queue_drift(tmp_path):
         chunk = await asyncio.wait_for(worker.get_output_chunk(), timeout=1.0)
         assert chunk is not None
 
-        # Verify all intermediate batches up to receipt timestamp were drained; no drift remains
-        assert len(worker._sent_batches) == 0
+        # Verify only a single batch was popped per synthesized chunk (matching GeminiWorker)
+        assert len(worker._sent_batches) == 4
 
         await worker.stop()
 
@@ -570,3 +570,35 @@ async def test_soniox_worker_mock_empty_tts_returns_early(tmp_path):
     assert worker._queue_out.empty()
 
     await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_soniox_worker_mock_audible_tone(tmp_path):
+    """Verify SonioxWorker in mock mode emits an audible tone (~500 Hz, amplitude ~0.2*32767)."""
+    queue = asyncio.Queue(maxsize=10)
+    log_file = str(tmp_path / "transcript_soniox.jsonl")
+    worker = SonioxWorker(
+        queue_in=queue,
+        mode="mock",
+        transcript_path=log_file,
+        simulated_stt_delay_s=0.01,
+        simulated_tts_delay_s=0.01,
+        batch_size=1,
+    )
+    await worker.start()
+    try:
+        pcm = (np.zeros(320, dtype=np.int16)).tobytes()
+        await queue.put(AudioBlock("sess", 0, 0, 1.0, pcm))
+        chunk = await asyncio.wait_for(worker.get_output_chunk(), timeout=1.0)
+        assert chunk is not None
+        samples = np.frombuffer(chunk.pcm_data, dtype=np.int16)
+        assert len(samples) > 0
+        max_amp = np.max(np.abs(samples))
+        assert 5000 <= max_amp <= 7000
+
+        from dubber.measure.latency import detect_speech_start
+
+        onset = detect_speech_start(samples, sample_rate=48000, threshold=500.0)
+        assert onset >= 0.0
+    finally:
+        await worker.stop()

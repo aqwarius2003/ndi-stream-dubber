@@ -10,6 +10,7 @@ Coordinates the complete audio translation pipeline:
 
 import asyncio
 import logging
+import time
 from types import TracebackType
 from typing import Any, Self
 
@@ -82,6 +83,9 @@ class DubberEngine:
         self.dropped_blocks: dict[str, int] = {"gemini": 0, "soniox": 0}
         self._running: bool = False
         self._tasks: list[asyncio.Task[Any]] = []
+        self._last_sink_write_time: float = 0.0
+        self._source_active: bool = False
+        self._sink_lock: asyncio.Lock = asyncio.Lock()
 
         # Immediately register worker states with the selector
         self._sync_worker_states_to_selector()
@@ -90,6 +94,17 @@ class DubberEngine:
     def is_running(self) -> bool:
         """Return True if background pipeline tasks are currently running."""
         return self._running
+
+    @property
+    def is_source_active(self) -> bool:
+        """Return True if the audio source is present and capturing."""
+        if self.source is None:
+            return False
+        if hasattr(self.source, "is_active") and callable(self.source.is_active):
+            return bool(self.source.is_active())
+        if hasattr(self.source, "_running"):
+            return bool(self.source._running)
+        return self._source_active
 
     def _sync_worker_states_to_selector(self) -> None:
         """Register worker state objects with the selector."""
@@ -158,16 +173,22 @@ class DubberEngine:
     async def _ingest_loop(self) -> None:
         """Read AudioBlocks continuously from source and distribute to branch queues."""
         try:
+            self._source_active = True
             while self._running and self.source is not None:
                 block = await self.source.read_block()
                 if block is None:
+                    self._source_active = False
                     logger.info("Ingest source finished or stopped.")
                     break
+                self._source_active = True
                 await self.dispatch_block_to_queues(block)
         except asyncio.CancelledError:
             pass
         except Exception:
+            self._source_active = False
             logger.exception("Error in DubberEngine ingest loop")
+        finally:
+            self._source_active = False
 
     async def _worker_output_loop(self, worker: GeminiWorker | SonioxWorker | BaseWorker) -> None:
         """Consume translated audio chunks from worker, update selector state, and route to sink."""
@@ -184,11 +205,40 @@ class DubberEngine:
                 # Route chunk through DubSelector (applies active branch filter, crossfade, silence on failure)
                 selected_chunk = self.selector.process_chunk(chunk)
                 if selected_chunk is not None and self.sink is not None:
-                    await self.sink.write_chunk(selected_chunk)
+                    async with self._sink_lock:
+                        await self.sink.write_chunk(selected_chunk)
+                        self._last_sink_write_time = time.monotonic()
         except asyncio.CancelledError:
             pass
         except Exception:
             logger.exception("Error in worker output loop")
+
+    async def _silence_heartbeat_loop(self) -> None:
+        """Continuously generate silence chunks to keep sink clocked during stalls/failures."""
+        try:
+            while self._running:
+                await asyncio.sleep(0.02)
+                if not self._running:
+                    break
+
+                now = time.monotonic()
+                elapsed = now - self._last_sink_write_time
+                source_active = self.is_source_active
+                alert_active = self.selector.is_alert_active()
+
+                if (
+                    elapsed >= 0.05
+                    and (source_active or alert_active)
+                    and self.sink is not None
+                ):
+                    silence_chunk = self.selector.create_silence_chunk(duration_ms=20.0)
+                    async with self._sink_lock:
+                        await self.sink.write_chunk(silence_chunk)
+                        self._last_sink_write_time = time.monotonic()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Error in DubberEngine silence heartbeat loop")
 
     async def start(self) -> None:
         """Start workers, sources, sinks, and background orchestration loops."""
@@ -197,6 +247,8 @@ class DubberEngine:
         self._running = True
         try:
             self._drain_queues()
+            self._last_sink_write_time = time.monotonic()
+            self._source_active = self.source is not None
 
             if self.source is not None:
                 await self.source.start()
@@ -213,6 +265,12 @@ class DubberEngine:
 
             self._tasks.append(
                 asyncio.create_task(self._ingest_loop(), name="dubber_ingest_loop")
+            )
+            self._tasks.append(
+                asyncio.create_task(
+                    self._silence_heartbeat_loop(),
+                    name="dubber_silence_heartbeat_loop",
+                )
             )
             if self.gemini_worker is not None:
                 self._tasks.append(

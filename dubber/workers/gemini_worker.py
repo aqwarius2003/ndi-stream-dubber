@@ -78,6 +78,7 @@ class GeminiWorker(BaseWorker):
 
         # Tracking sent batches for live mode correlation: (session_id, block_index, source_time, send_time)
         self._sent_batches: deque[tuple[str, int, float, float]] = deque(maxlen=500)
+        self._mock_sample_count: int = 0
 
     async def start(self) -> None:
         """Start worker background processing task."""
@@ -192,7 +193,12 @@ class GeminiWorker(BaseWorker):
 
                 batch_duration_ms = sum(b.duration_ms for b in batch)
                 num_samples = int(48000 * (batch_duration_ms / 1000.0))
-                pcm_data = np.zeros(num_samples, dtype=np.int16).tobytes()
+                if num_samples > 0:
+                    t = (self._mock_sample_count + np.arange(num_samples, dtype=np.float32)) / 48000.0
+                    self._mock_sample_count += num_samples
+                    pcm_data = (np.sin(2.0 * np.pi * 440.0 * t) * (0.2 * 32767)).astype(np.int16).tobytes()
+                else:
+                    pcm_data = b""
 
                 mock_text = (
                     f"Mock translated speech for session {session_id} block {block_index}"

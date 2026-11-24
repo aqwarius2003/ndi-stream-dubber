@@ -18,16 +18,37 @@ logger = logging.getLogger(__name__)
 
 
 def _poll_key() -> str | None:
-    """Non-blocking check for keyboard input on Windows console."""
+    """Non-blocking check for keyboard input on Windows and POSIX console."""
     if not sys.stdin or not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
         return None
-    try:
-        import msvcrt
 
-        if msvcrt.kbhit():
-            ch = msvcrt.getch()
-            return ch.decode("utf-8", errors="ignore")
-    except (ImportError, OSError, UnicodeDecodeError):
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+
+            if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                return ch.decode("utf-8", errors="ignore")
+        except (ImportError, OSError, UnicodeDecodeError):
+            return None
+        return None
+
+    # POSIX platform (Linux / macOS)
+    try:
+        import select
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            rlist, _, _ = select.select([sys.stdin], [], [], 0)
+            if rlist:
+                return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    except (ImportError, OSError, UnicodeDecodeError, ValueError):
         return None
     return None
 

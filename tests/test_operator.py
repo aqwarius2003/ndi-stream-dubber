@@ -116,6 +116,54 @@ def test_operator_api_alert_reporting(tmp_path):
     assert data["branches"]["gemini"]["status"] == "ERROR"
 
 
+def test_operator_api_health_endpoint(tmp_path):
+    config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
+    engine = DubberEngine(config)
+    app = create_app(engine)
+    client = TestClient(app)
+
+    # Normal healthy status
+    res = client.get("/health")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "ok"
+    assert data["active_branch"] == "gemini"
+    assert data["alert"] is False
+
+    # Degraded status when active branch fails
+    engine.selector.update_branch_state(BranchState("gemini", status="ERROR"))
+    res_err = client.get("/health")
+    assert res_err.status_code == 200
+    data_err = res_err.json()
+    assert data_err["status"] == "degraded"
+    assert data_err["alert"] is True
+
+
+def test_operator_api_metrics_endpoint(tmp_path):
+    config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
+    engine = DubberEngine(config)
+    app = create_app(engine)
+    client = TestClient(app)
+
+    # JSON metrics
+    res = client.get("/metrics")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["active_branch"] == "gemini"
+    assert "branches" in data
+    assert "gemini" in data["branches"]
+    assert "soniox" in data["branches"]
+    assert "total_dropped_blocks" in data
+
+    # Prometheus text metrics
+    res_prom = client.get("/metrics?format=prometheus")
+    assert res_prom.status_code == 200
+    assert "text/plain" in res_prom.headers["content-type"]
+    assert "dubber_active_branch" in res_prom.text
+    assert "dubber_latency_seconds" in res_prom.text
+    assert "dubber_dropped_blocks_total" in res_prom.text
+
+
 def test_generate_dashboard(tmp_path):
     config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
     engine = DubberEngine(config)
@@ -169,6 +217,27 @@ def test_poll_key_handling(monkeypatch):
 
     # Case 6: kbhit is False
     mock_msvcrt.kbhit.return_value = False
+    assert cli_mod._poll_key() is None
+
+    # Case 7: POSIX platform (sys.platform == "linux")
+    monkeypatch.setattr(sys, "platform", "linux")
+    mock_select = MagicMock()
+    mock_select.select.return_value = ([sys.stdin], [], [])
+    mock_termios = MagicMock()
+    mock_termios.tcgetattr.return_value = ["dummy_settings"]
+    mock_tty = MagicMock()
+    monkeypatch.setitem(sys.modules, "select", mock_select)
+    monkeypatch.setitem(sys.modules, "termios", mock_termios)
+    monkeypatch.setitem(sys.modules, "tty", mock_tty)
+    monkeypatch.setattr(sys.stdin, "read", lambda _n: "1")
+    monkeypatch.setattr(sys.stdin, "fileno", lambda: 0)
+
+    assert cli_mod._poll_key() == "1"
+    mock_tty.setcbreak.assert_called_once()
+    mock_termios.tcsetattr.assert_called_once()
+
+    # Case 8: POSIX platform with no input waiting
+    mock_select.select.return_value = ([], [], [])
     assert cli_mod._poll_key() is None
 
 

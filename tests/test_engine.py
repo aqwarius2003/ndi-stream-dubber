@@ -273,13 +273,17 @@ async def test_engine_active_failure_outputs_silence(tmp_path):
             pcm_data=b"\x50\x00" * 480,
         )
         await w_gemini.queue_out.put(c_err)
-        await asyncio.sleep(0.05)
+        for _ in range(20):
+            if sink.chunks:
+                break
+            await asyncio.sleep(0.005)
 
-        # Chunk should have been converted to silence
-        assert len(sink.chunks) == 1
-        samples = np.frombuffer(sink.chunks[0].pcm_data, dtype=np.int16)
-        assert np.all(samples == 0)
-        assert len(samples) == 480
+        # Output chunks during failure must all be pure silence
+        assert len(sink.chunks) >= 1
+        for ch in sink.chunks:
+            samples = np.frombuffer(ch.pcm_data, dtype=np.int16)
+            assert np.all(samples == 0)
+        assert len(np.frombuffer(sink.chunks[0].pcm_data, dtype=np.int16)) == 480
     finally:
         await engine.stop()
 
@@ -366,6 +370,53 @@ async def test_engine_queue_drain_on_restart():
     await engine.dispatch_block_to_queues(b0)
     assert engine.queue_gemini.qsize() == 1
     assert engine.queue_soniox.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_engine_silence_heartbeat_on_active_worker_stall():
+    """Verify silence heartbeat continuously clocks sink when active worker stalls for > 50 ms."""
+
+    class ContinuousSource(AudioSource):
+        def __init__(self) -> None:
+            self._running = True
+
+        async def start(self) -> None:
+            self._running = True
+
+        async def stop(self) -> None:
+            self._running = False
+
+        async def read_block(self) -> AudioBlock | None:
+            if not self._running:
+                return None
+            await asyncio.sleep(0.01)
+            return AudioBlock("sess", 0, 0, 1.0, b"\x00" * 640)
+
+    source = ContinuousSource()
+    sink = DummyAudioSink()
+    config = DubberConfig(max_queue_size=10)
+    q_gemini = asyncio.Queue(maxsize=10)
+    w_gemini = DummyWorker("gemini", q_gemini)
+    # w_gemini does NOT emit any output chunks (stalled active worker)
+
+    engine = DubberEngine(
+        config,
+        source=source,
+        sink=sink,
+        gemini_worker=w_gemini,
+    )
+    await engine.start()
+    try:
+        # Wait 90 ms so silence heartbeat triggers at elapsed >= 50 ms
+        await asyncio.sleep(0.09)
+
+        # Sink must have received silence chunks keeping clock active
+        assert len(sink.chunks) >= 1
+        for chunk in sink.chunks:
+            samples = np.frombuffer(chunk.pcm_data, dtype=np.int16)
+            assert np.all(samples == 0)
+    finally:
+        await engine.stop()
 
     await engine.stop()
     assert engine.queue_gemini.empty()
