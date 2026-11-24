@@ -10,12 +10,14 @@ import wave
 from typing import Any
 
 import numpy as np
+import uvicorn
 
 from dubber.config import DubberConfig
 from dubber.engine import DubberEngine
 from dubber.ingest.wav_source import WAVAudioSource
 from dubber.measure.latency import LatencyAnalyzer, LatencyResult
 from dubber.measure.report import generate_latency_report
+from dubber.operator.server import create_app
 from dubber.sink.wav_sink import WAVAudioSink
 from dubber.types import BroadcastAudioChunk
 
@@ -64,8 +66,8 @@ class _MeasuringWAVAudioSink(WAVAudioSink):
 
 
 async def run_test_pipeline(
-    wav_input: str,
-    wav_output: str,
+    wav_input: str = "data/test_speech_ru.wav",
+    wav_output: str = "output/test_broadcast_en.wav",
     state_file: str = "state.json",
     active_branch: str = "gemini",
     mode: str = "mock",
@@ -78,6 +80,12 @@ async def run_test_pipeline(
         logger.info("Input WAV '%s' not found. Creating sample tone audio.", wav_input)
         _generate_sample_wav(wav_input, duration_s=1.0)
 
+    config = DubberConfig.from_env()
+    config.source_type = "wav"
+    config.provider_mode = mode  # type: ignore[arg-type]
+    config.wav_file_path = wav_input
+    config.state_file_path = state_file
+
     analyzer = LatencyAnalyzer(max_allowed_s=max_allowed_s)
     source = WAVAudioSource(wav_input, real_time_pace=real_time_pace)
     sink = _MeasuringWAVAudioSink(
@@ -85,13 +93,6 @@ async def run_test_pipeline(
         analyzer=analyzer,
         sample_rate=48000,
         channels=1,
-    )
-
-    config = DubberConfig(
-        source_type="wav",
-        provider_mode=mode,  # type: ignore[arg-type]
-        wav_file_path=wav_input,
-        state_file_path=state_file,
     )
 
     engine = DubberEngine(config, source=source, sink=sink)
@@ -120,16 +121,23 @@ async def run_test_pipeline(
 
 async def run_operator_service(args: argparse.Namespace) -> int:
     """Launch engine, background FastAPI control server, and Rich TUI dashboard."""
-    config = DubberConfig(
-        source_type=getattr(args, "source", "wav"),
-        provider_mode=getattr(args, "mode", "mock"),
-        wav_file_path=getattr(args, "wav_file", "data/test_speech_ru.wav"),
-        ndi_source_name=getattr(args, "ndi_source", None),
-        ndi_sink_name=getattr(args, "ndi_sink", "Dub_EN"),
-        state_file_path=getattr(args, "state_file", "state.json"),
-        http_port=getattr(args, "port", 8000),
-        http_host=getattr(args, "host", "127.0.0.1"),
-    )
+    config = DubberConfig.from_env()
+    if getattr(args, "source", None):
+        config.source_type = args.source
+    if getattr(args, "mode", None):
+        config.provider_mode = args.mode
+    if getattr(args, "wav", None):
+        config.wav_file_path = args.wav
+    if getattr(args, "ndi_source", None):
+        config.ndi_source_name = args.ndi_source
+    if getattr(args, "ndi_sink", None):
+        config.ndi_sink_name = args.ndi_sink
+    if getattr(args, "state_file", None):
+        config.state_file_path = args.state_file
+    if getattr(args, "port", None):
+        config.http_port = args.port
+    if getattr(args, "host", None):
+        config.http_host = args.host
 
     if config.source_type == "wav":
         wav_path = config.wav_file_path or "data/test_speech_ru.wav"
@@ -141,14 +149,24 @@ async def run_operator_service(args: argparse.Namespace) -> int:
 
         source = NDIAudioSource(source_name=config.ndi_source_name)
 
-    sink: Any = None
-    try:
-        from dubber.sink.ndi_sink import NDIAudioSink
+    sink_type = getattr(args, "sink", "ndi")
+    out_wav_path = getattr(args, "out_wav", "output/broadcast_en.wav")
 
-        sink = NDIAudioSink(sink_name=config.ndi_sink_name)
-    except Exception as exc:
-        logger.warning("Could not initialize NDIAudioSink (%s). Falling back to WAV sink.", exc)
-        sink = WAVAudioSink("data/output_live.wav")
+    sink: Any = None
+    if sink_type == "wav":
+        sink = WAVAudioSink(out_wav_path)
+    else:
+        try:
+            from dubber.sink.ndi_sink import NDIAudioSink
+
+            sink = NDIAudioSink(sink_name=config.ndi_sink_name)
+        except (RuntimeError, ImportError, OSError) as exc:
+            logger.warning(
+                "Could not initialize NDIAudioSink (%s). Falling back to WAVAudioSink('%s').",
+                exc,
+                out_wav_path,
+            )
+            sink = WAVAudioSink(out_wav_path)
 
     engine = DubberEngine(config, source=source, sink=sink)
     active_branch = getattr(args, "active_branch", "gemini")
@@ -156,9 +174,6 @@ async def run_operator_service(args: argparse.Namespace) -> int:
         engine.selector.switch_branch(active_branch, force=True)
 
     await engine.start()
-
-    from dubber.operator.server import create_app
-    import uvicorn
 
     app = create_app(engine)
     server_config = uvicorn.Config(
@@ -214,9 +229,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Input audio source type (default: wav)",
     )
     run_parser.add_argument(
+        "--sink",
+        choices=["ndi", "wav"],
+        default="ndi",
+        help="Output audio sink publisher type (default: ndi)",
+    )
+    run_parser.add_argument(
+        "--wav",
         "--wav-file",
+        dest="wav",
         default="data/test_speech_ru.wav",
         help="Input WAV file path for wav source (default: data/test_speech_ru.wav)",
+    )
+    run_parser.add_argument(
+        "--out-wav",
+        dest="out_wav",
+        default="output/broadcast_en.wav",
+        help="Output WAV file path when using wav sink (default: output/broadcast_en.wav)",
     )
     run_parser.add_argument(
         "--ndi-source",
@@ -269,16 +298,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Execute reproducible WAV test run, record latency, and print report",
     )
     test_parser.add_argument(
+        "--wav",
         "--input",
         "-i",
+        dest="wav",
         default="data/test_speech_ru.wav",
         help="Input WAV file path (default: data/test_speech_ru.wav)",
     )
     test_parser.add_argument(
+        "--out-wav",
         "--output",
         "-o",
-        default="data/test_output_en.wav",
-        help="Output WAV file path (default: data/test_output_en.wav)",
+        dest="out_wav",
+        default="output/test_broadcast_en.wav",
+        help="Output WAV file path (default: output/test_broadcast_en.wav)",
     )
     test_parser.add_argument(
         "--state-file",
@@ -333,8 +366,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "test-run":
         return asyncio.run(
             run_test_pipeline(
-                wav_input=args.input,
-                wav_output=args.output,
+                wav_input=args.wav,
+                wav_output=args.out_wav,
                 state_file=args.state_file,
                 active_branch=args.active_branch,
                 mode=args.mode,

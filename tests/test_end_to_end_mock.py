@@ -1,15 +1,18 @@
 import asyncio
+import json
+import urllib.request
 import wave
+
 import numpy as np
 import pytest
 
+from dubber.cli import build_parser, main, run_operator_service, run_test_pipeline
 from dubber.config import DubberConfig
 from dubber.engine import DubberEngine
 from dubber.ingest.wav_source import WAVAudioSource
-from dubber.sink.wav_sink import WAVAudioSink
-from dubber.measure.latency import LatencyAnalyzer, LatencyResult
+from dubber.measure.latency import LatencyAnalyzer
 from dubber.measure.report import generate_latency_report
-from dubber.cli import main, run_test_pipeline
+from dubber.sink.wav_sink import WAVAudioSink
 
 
 def test_latency_analyzer_and_report():
@@ -27,9 +30,9 @@ def test_latency_analyzer_and_report():
 
 
 def test_detect_speech_start():
-    analyzer = LatencyAnalyzer()
-    # 0.5s silence followed by 0.5s 440Hz tone at 48000 Hz
+    analyzer = LatencyAnalyzer(energy_threshold=500.0)
     sr = 48000
+    # 0.5s silence followed by 0.5s 440Hz tone at 48000 Hz
     silence = np.zeros(int(0.5 * sr), dtype=np.int16)
     tone = (0.5 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.5, int(0.5 * sr), endpoint=False)) * 32767).astype(np.int16)
     audio = np.concatenate([silence, tone])
@@ -37,9 +40,9 @@ def test_detect_speech_start():
     onset_s = analyzer.detect_speech_start(audio, sample_rate=sr, window_ms=20)
     assert 0.48 <= onset_s <= 0.52
 
-    # Completely silent audio
+    # Pure silence must return -1.0
     silent_audio = np.zeros(sr, dtype=np.int16)
-    assert analyzer.detect_speech_start(silent_audio, sample_rate=sr) == 0.0
+    assert analyzer.detect_speech_start(silent_audio, sample_rate=sr) == -1.0
 
 
 @pytest.mark.asyncio
@@ -124,7 +127,7 @@ def test_main_cli_dispatch(tmp_path, capsys):
     code_no_cmd = main([])
     assert code_no_cmd == 1
 
-    # Test main with test-run
+    # Test main with test-run using --wav and --out-wav flags
     samples = (0.5 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.2, 3200, endpoint=False)) * 32767).astype(np.int16)
     with wave.open(str(in_wav), "wb") as wf:
         wf.setnchannels(1)
@@ -134,8 +137,8 @@ def test_main_cli_dispatch(tmp_path, capsys):
 
     code = main([
         "test-run",
-        "--input", str(in_wav),
-        "--output", str(out_wav),
+        "--wav", str(in_wav),
+        "--out-wav", str(out_wav),
         "--state-file", str(state_file),
         "--active-branch", "soniox",
         "--threshold", "3.0",
@@ -147,13 +150,52 @@ def test_main_cli_dispatch(tmp_path, capsys):
     assert "PHARMALIVE DUBBER LATENCY REPORT" in out
 
 
+def test_cli_flags_parsing():
+    parser = build_parser()
+
+    # Verify run flags
+    run_args = parser.parse_args([
+        "run",
+        "--sink", "wav",
+        "--wav", "data/custom_ru.wav",
+        "--out-wav", "output/custom_out.wav",
+        "--no-tui",
+    ])
+    assert run_args.sink == "wav"
+    assert run_args.wav == "data/custom_ru.wav"
+    assert run_args.out_wav == "output/custom_out.wav"
+    assert run_args.no_tui is True
+
+    # Verify run flags alias --wav-file
+    run_alias_args = parser.parse_args([
+        "run",
+        "--wav-file", "data/alias_ru.wav",
+    ])
+    assert run_alias_args.wav == "data/alias_ru.wav"
+
+    # Verify test-run flags: --wav and --out-wav
+    test_args = parser.parse_args([
+        "test-run",
+        "--wav", "data/test_in.wav",
+        "--out-wav", "output/test_out.wav",
+    ])
+    assert test_args.wav == "data/test_in.wav"
+    assert test_args.out_wav == "output/test_out.wav"
+
+    # Verify test-run aliases: --input and --output
+    test_alias_args = parser.parse_args([
+        "test-run",
+        "-i", "data/input.wav",
+        "-o", "output/output.wav",
+    ])
+    assert test_alias_args.wav == "data/input.wav"
+    assert test_alias_args.out_wav == "output/output.wav"
+
+
 @pytest.mark.asyncio
 async def test_run_operator_service_headless(tmp_path):
-    import urllib.request
-    import json
-    from dubber.cli import build_parser, run_operator_service
-
     in_wav = tmp_path / "in.wav"
+    out_wav = tmp_path / "out.wav"
     state_file = tmp_path / "state.json"
     samples = (0.5 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.2, 3200, endpoint=False)) * 32767).astype(np.int16)
     with wave.open(str(in_wav), "wb") as wf:
@@ -166,7 +208,9 @@ async def test_run_operator_service_headless(tmp_path):
     args = parser.parse_args([
         "run",
         "--source", "wav",
-        "--wav-file", str(in_wav),
+        "--sink", "wav",
+        "--wav", str(in_wav),
+        "--out-wav", str(out_wav),
         "--state-file", str(state_file),
         "--port", "8999",
         "--host", "127.0.0.1",
@@ -179,6 +223,7 @@ async def test_run_operator_service_headless(tmp_path):
 
     try:
         loop = asyncio.get_running_loop()
+
         def fetch():
             with urllib.request.urlopen("http://127.0.0.1:8999/status", timeout=2.0) as req:
                 return req.status, json.loads(req.read().decode("utf-8"))
@@ -193,4 +238,3 @@ async def test_run_operator_service_headless(tmp_path):
             await service_task
         except asyncio.CancelledError:
             pass
-
