@@ -17,7 +17,7 @@ from dubber.config import DubberConfig
 from dubber.ingest.base import AudioSource
 from dubber.selector.selector import DubSelector
 from dubber.sink.base import AudioSink
-from dubber.types import AudioBlock, BroadcastAudioChunk
+from dubber.types import AudioBlock, BranchType, BroadcastAudioChunk
 from dubber.workers.base import BaseWorker
 from dubber.workers.gemini_worker import GeminiWorker
 from dubber.workers.soniox_worker import SonioxWorker
@@ -83,31 +83,55 @@ class DubberEngine:
         self._running: bool = False
         self._tasks: list[asyncio.Task[Any]] = []
 
+        # Immediately register worker states with the selector
+        self._sync_worker_states_to_selector()
+
     @property
     def is_running(self) -> bool:
         """Return True if background pipeline tasks are currently running."""
         return self._running
 
+    def _sync_worker_states_to_selector(self) -> None:
+        """Register worker state objects with the selector."""
+        if self.gemini_worker and hasattr(self.gemini_worker, "get_state"):
+            self.selector.update_branch_state(self.gemini_worker.get_state())
+        if self.soniox_worker and hasattr(self.soniox_worker, "get_state"):
+            self.selector.update_branch_state(self.soniox_worker.get_state())
+
+    def _record_drop(self, name: BranchType, dropped_block_index: int) -> None:
+        """Record a dropped block on engine, selector, and worker drop metrics."""
+        self.dropped_blocks[name] = self.dropped_blocks.get(name, 0) + 1
+        logger.warning(
+            "Queue overflow on branch '%s'. Dropped block_index=%d to preserve real-time pace.",
+            name,
+            dropped_block_index,
+        )
+        if self.selector is not None:
+            branch_state = self.selector.get_branch_state(name)
+            branch_state.dropped_blocks_count = self.dropped_blocks[name]
+
+        worker = self.gemini_worker if name == "gemini" else self.soniox_worker
+        if worker is not None and hasattr(worker, "get_state"):
+            worker.get_state().dropped_blocks_count = self.dropped_blocks[name]
+
+    def _drain_queues(self) -> None:
+        """Drain worker queues to prevent stale blocks from leaking across restarts."""
+        for q in (self.queue_gemini, self.queue_soniox):
+            if q is not None:
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
     def _dispatch_to_branch(
-        self, name: str, queue: asyncio.Queue[AudioBlock], block: AudioBlock
+        self, name: BranchType, queue: asyncio.Queue[AudioBlock], block: AudioBlock
     ) -> None:
         """Dispatch block to a branch queue applying drop-oldest policy on overflow."""
         if queue.full():
             try:
                 dropped = queue.get_nowait()
-                self.dropped_blocks[name] = self.dropped_blocks.get(name, 0) + 1
-                logger.warning(
-                    "Queue overflow on branch '%s'. Dropped block_index=%d to preserve real-time pace.",
-                    name,
-                    dropped.block_index,
-                )
-                if self.selector is not None:
-                    branch_state = self.selector.get_branch_state(name)  # type: ignore[arg-type]
-                    branch_state.dropped_blocks_count = self.dropped_blocks[name]
-
-                worker = self.gemini_worker if name == "gemini" else self.soniox_worker
-                if worker is not None and hasattr(worker, "get_state"):
-                    worker.get_state().dropped_blocks_count = self.dropped_blocks[name]
+                self._record_drop(name, dropped.block_index)
             except asyncio.QueueEmpty:
                 pass
 
@@ -117,12 +141,7 @@ class DubberEngine:
             # Fallback if queue became full between check and put
             try:
                 dropped = queue.get_nowait()
-                self.dropped_blocks[name] = self.dropped_blocks.get(name, 0) + 1
-                logger.warning(
-                    "Queue overflow on branch '%s'. Dropped block_index=%d to preserve real-time pace.",
-                    name,
-                    dropped.block_index,
-                )
+                self._record_drop(name, dropped.block_index)
                 queue.put_nowait(block)
             except (asyncio.QueueEmpty, asyncio.QueueFull):
                 pass
@@ -176,40 +195,49 @@ class DubberEngine:
         if self._running:
             return
         self._running = True
+        try:
+            self._drain_queues()
 
-        if self.source is not None:
-            await self.source.start()
-        if self.sink is not None:
-            await self.sink.start()
+            if self.source is not None:
+                await self.source.start()
+            if self.sink is not None:
+                await self.sink.start()
 
-        if self.gemini_worker is not None:
-            await self.gemini_worker.start()
-        if self.soniox_worker is not None:
-            await self.soniox_worker.start()
+            if self.gemini_worker is not None:
+                await self.gemini_worker.start()
+            if self.soniox_worker is not None:
+                await self.soniox_worker.start()
 
-        self._tasks.append(
-            asyncio.create_task(self._ingest_loop(), name="dubber_ingest_loop")
-        )
-        if self.gemini_worker is not None:
+            # Update selector immediately with live states of started workers
+            self._sync_worker_states_to_selector()
+
             self._tasks.append(
-                asyncio.create_task(
-                    self._worker_output_loop(self.gemini_worker),
-                    name="dubber_gemini_output_loop",
-                )
+                asyncio.create_task(self._ingest_loop(), name="dubber_ingest_loop")
             )
-        if self.soniox_worker is not None:
-            self._tasks.append(
-                asyncio.create_task(
-                    self._worker_output_loop(self.soniox_worker),
-                    name="dubber_soniox_output_loop",
+            if self.gemini_worker is not None:
+                self._tasks.append(
+                    asyncio.create_task(
+                        self._worker_output_loop(self.gemini_worker),
+                        name="dubber_gemini_output_loop",
+                    )
                 )
-            )
+            if self.soniox_worker is not None:
+                self._tasks.append(
+                    asyncio.create_task(
+                        self._worker_output_loop(self.soniox_worker),
+                        name="dubber_soniox_output_loop",
+                    )
+                )
 
-        logger.info("DubberEngine started successfully.")
+            logger.info("DubberEngine started successfully.")
+        except BaseException:
+            await self.stop()
+            raise
 
     async def stop(self) -> None:
         """Safely stop all background orchestration loops, workers, and I/O streams."""
         if not self._running and not self._tasks:
+            self._drain_queues()
             return
         self._running = False
 
@@ -233,6 +261,7 @@ class DubberEngine:
         if self.sink is not None:
             await self.sink.stop()
 
+        self._drain_queues()
         logger.info("DubberEngine stopped.")
 
     async def __aenter__(self) -> Self:

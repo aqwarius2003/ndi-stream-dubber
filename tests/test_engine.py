@@ -315,3 +315,58 @@ async def test_engine_ingest_loop():
         assert b0.block_index == 0
     finally:
         await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_engine_started_worker_state_registration(tmp_path):
+    """Verify that immediately after await engine.start(), selector observes READY status."""
+    config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
+    engine = DubberEngine(config)
+
+    # In mock mode, workers start in READY status
+    await engine.start()
+    try:
+        assert engine.selector.get_branch_state("gemini").status == "READY"
+        assert engine.selector.get_branch_state("soniox").status == "READY"
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_engine_start_failure_cleans_up(tmp_path):
+    """If a component fails during start(), engine.stop() is executed to clean up."""
+    config = DubberConfig(state_file_path=str(tmp_path / "state.json"))
+    sink = DummyAudioSink()
+
+    class FailingSource(AudioSource):
+        async def start(self) -> None:
+            raise RuntimeError("Capture device failed")
+
+        async def stop(self) -> None:
+            pass
+
+        async def read_block(self) -> AudioBlock | None:
+            return None
+
+    engine = DubberEngine(config, source=FailingSource(), sink=sink)
+    with pytest.raises(RuntimeError, match="Capture device failed"):
+        await engine.start()
+
+    assert not engine.is_running
+    assert sink.stopped
+
+
+@pytest.mark.asyncio
+async def test_engine_queue_drain_on_restart():
+    """Verify queues are drained on start/stop to prevent stale blocks leaking across restarts."""
+    config = DubberConfig(max_queue_size=10)
+    engine = DubberEngine(config)
+
+    b0 = AudioBlock("sess", 0, 0, 1.0, b"\x00" * 640)
+    await engine.dispatch_block_to_queues(b0)
+    assert engine.queue_gemini.qsize() == 1
+    assert engine.queue_soniox.qsize() == 1
+
+    await engine.stop()
+    assert engine.queue_gemini.empty()
+    assert engine.queue_soniox.empty()
