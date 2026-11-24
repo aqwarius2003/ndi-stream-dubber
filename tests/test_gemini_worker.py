@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -41,12 +43,11 @@ async def test_gemini_worker_mock_flow(tmp_path):
     assert state.last_audio_time > 0
     assert len(state.last_transcript) > 0
 
-    with open(log_file, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-        assert len(lines) >= 1
-        data = json.loads(lines[0])
-        assert data["branch"] == "gemini"
-        assert "text" in data
+    lines = Path(log_file).read_text(encoding="utf-8").splitlines()
+    assert len(lines) >= 1
+    data = json.loads(lines[0])
+    assert data["branch"] == "gemini"
+    assert "text" in data
 
     await worker.stop()
 
@@ -381,5 +382,61 @@ async def test_gemini_worker_live_subtasks_cleanup_on_stop(tmp_path):
             for t in spawned_tasks:
                 assert t.done()
                 assert t.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_gemini_worker_mock_continuous_consumption(tmp_path):
+    queue = asyncio.Queue(maxsize=10)
+    log_file = str(tmp_path / "transcript_gemini.jsonl")
+    worker = GeminiWorker(
+        queue_in=queue,
+        mode="mock",
+        transcript_path=log_file,
+        simulated_delay_s=0.1,
+        batch_size=2,
+    )
+    await worker.start()
+
+    pcm = (np.zeros(320, dtype=np.int16)).tobytes()
+    # Feed 4 blocks (2 batches)
+    for i in range(4):
+        await queue.put(AudioBlock("sess", i, i * 320, 1.0 + i * 0.02, pcm))
+
+    # Give very short time for mock loop to consume blocks from queue_in
+    await asyncio.sleep(0.02)
+    # Queue should be consumed immediately even though simulated delay (0.1s) is pending
+    assert queue.empty()
+
+    # After simulated delay, chunks arrive
+    chunk1 = await asyncio.wait_for(worker.get_output_chunk(), timeout=1.0)
+    chunk2 = await asyncio.wait_for(worker.get_output_chunk(), timeout=1.0)
+    assert chunk1 is not None and chunk2 is not None
+
+    await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_gemini_worker_dropped_block_logging(tmp_path, caplog):
+    queue = asyncio.Queue(maxsize=10)
+    log_file = str(tmp_path / "transcript_gemini.jsonl")
+    worker = GeminiWorker(
+        queue_in=queue,
+        mode="mock",
+        transcript_path=log_file,
+        simulated_delay_s=0.01,
+        batch_size=1,
+        queue_out_size=1,
+    )
+    await worker.start()
+
+    pcm = (np.zeros(320, dtype=np.int16)).tobytes()
+    with caplog.at_level(logging.WARNING):
+        for i in range(3):
+            await queue.put(AudioBlock("sess", i, i * 320, 1.0 + i * 0.02, pcm))
+        await asyncio.sleep(0.1)
+
+    assert "GeminiWorker discarded block" in caplog.text
+    await worker.stop()
+
 
 

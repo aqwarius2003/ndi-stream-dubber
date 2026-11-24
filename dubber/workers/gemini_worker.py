@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Literal
 
@@ -67,11 +68,16 @@ class GeminiWorker(BaseWorker):
 
         self._stopped: bool = False
         self._worker_task: asyncio.Task[None] | None = None
+        self._emission_tasks: set[asyncio.Task[None]] = set()
 
         self._current_session_id: str = "sess"
         self._current_block_index: int = 0
         self._current_source_time: float = 0.0
         self._last_send_time: float = 0.0
+        self._last_logged_transcript: str = ""
+
+        # Tracking sent batches for live mode correlation: (session_id, block_index, source_time, send_time)
+        self._sent_batches: deque[tuple[str, int, float, float]] = deque(maxlen=500)
 
     async def start(self) -> None:
         """Start worker background processing task."""
@@ -80,6 +86,9 @@ class GeminiWorker(BaseWorker):
         self._stopped = False
         # Reset output queue to clear any leftover sentinel/None from previous stop()
         self._queue_out = asyncio.Queue(maxsize=self.queue_out_size)
+        self._emission_tasks.clear()
+        self._sent_batches.clear()
+        self._last_logged_transcript = ""
         self._state.status = "READY"
         if self.mode == "mock":
             self._worker_task = asyncio.create_task(self._mock_loop())
@@ -91,15 +100,28 @@ class GeminiWorker(BaseWorker):
         if self._stopped:
             return
         self._stopped = True
+
+        # Stop main worker loop task
         if self._worker_task is not None:
             self._worker_task.cancel()
             try:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Error stopping GeminiWorker task: %s", exc)
             self._worker_task = None
+
+        # Cancel and cleanup any pending delayed emission tasks
+        for task in list(self._emission_tasks):
+            if not task.done():
+                task.cancel()
+        if self._emission_tasks:
+            try:
+                await asyncio.gather(*list(self._emission_tasks), return_exceptions=True)
+            except Exception:  # noqa: S110, BLE001
+                pass
+        self._emission_tasks.clear()
 
         try:
             self._queue_out.put_nowait(None)
@@ -142,11 +164,11 @@ class GeminiWorker(BaseWorker):
             with open(self.transcript_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
-        except Exception as exc:
+        except OSError as exc:
             logger.error("Failed to log transcript: %s", exc)
 
     async def _mock_loop(self) -> None:
-        """Simulation loop for mock mode."""
+        """Simulation loop for mock mode. Consumes incoming blocks continuously."""
         self._state.status = "READY"
         while not self._stopped:
             try:
@@ -158,16 +180,12 @@ class GeminiWorker(BaseWorker):
                             self.queue_in.get(), timeout=0.03
                         )
                         batch.append(next_blk)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         break
-
-                if self.simulated_delay_s > 0:
-                    await asyncio.sleep(self.simulated_delay_s)
 
                 if self._stopped:
                     break
 
-                now = time.monotonic()
                 session_id = batch[0].session_id
                 block_index = batch[0].block_index
                 source_time = batch[0].source_time
@@ -179,12 +197,6 @@ class GeminiWorker(BaseWorker):
                 mock_text = (
                     f"Mock translated speech for session {session_id} block {block_index}"
                 )
-                self._log_transcript(session_id, block_index, source_time, mock_text)
-
-                self._state.last_transcript = mock_text
-                self._state.status = "RUNNING"
-                self._state.last_audio_time = now
-                self._state.latency_s = self.simulated_delay_s
 
                 chunk = BroadcastAudioChunk(
                     session_id=session_id,
@@ -197,21 +209,62 @@ class GeminiWorker(BaseWorker):
                     pcm_data=pcm_data,
                 )
 
-                if self._queue_out.full():
-                    try:
-                        _ = self._queue_out.get_nowait()
-                        self._state.dropped_blocks_count += 1
-                    except asyncio.QueueEmpty:
-                        pass
-                await self._queue_out.put(chunk)
+                # Schedule delayed emission without blocking the mock consumption loop
+                emit_task = asyncio.create_task(
+                    self._delayed_emit(chunk, mock_text, self.simulated_delay_s),
+                    name=f"mock_emit_{block_index}",
+                )
+                self._emission_tasks.add(emit_task)
+                emit_task.add_done_callback(self._emission_tasks.discard)
 
             except asyncio.CancelledError:
                 break
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.error("Error in GeminiWorker mock loop: %s", exc)
                 self._state.status = "ERROR"
                 self._state.error_message = str(exc)
                 await asyncio.sleep(0.1)
+
+    async def _delayed_emit(
+        self,
+        chunk: BroadcastAudioChunk,
+        mock_text: str,
+        delay_s: float,
+    ) -> None:
+        """Emit translated chunk after simulated processing delay."""
+        try:
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+            if self._stopped:
+                return
+
+            now = time.monotonic()
+            if mock_text != self._last_logged_transcript:
+                self._last_logged_transcript = mock_text
+                self._log_transcript(
+                    chunk.session_id, chunk.block_index, chunk.source_time, mock_text
+                )
+                self._state.last_transcript = mock_text
+
+            self._state.status = "RUNNING"
+            self._state.last_audio_time = now
+            self._state.latency_s = delay_s
+
+            if self._queue_out.full():
+                try:
+                    dropped = self._queue_out.get_nowait()
+                    if dropped is not None:
+                        logger.warning(
+                            "GeminiWorker discarded block %d", dropped.block_index
+                        )
+                    self._state.dropped_blocks_count += 1
+                except asyncio.QueueEmpty:
+                    pass
+            await self._queue_out.put(chunk)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error in GeminiWorker delayed emission: %s", exc)
 
     async def _live_loop(self) -> None:
         """Background loop for live Gemini Live Translate connection."""
@@ -253,7 +306,7 @@ class GeminiWorker(BaseWorker):
                     )
 
                     try:
-                        done, pending = await asyncio.wait(
+                        done, _ = await asyncio.wait(
                             [sender_task, receiver_task],
                             return_when=asyncio.FIRST_COMPLETED,
                         )
@@ -267,12 +320,12 @@ class GeminiWorker(BaseWorker):
                                 task.cancel()
                                 try:
                                     await task
-                                except (asyncio.CancelledError, Exception):
+                                except (asyncio.CancelledError, Exception):  # noqa: S110, BLE001
                                     pass
 
             except asyncio.CancelledError:
                 break
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("GeminiWorker live connection error: %s", exc)
                 self._state.status = "ERROR"
                 self._state.error_message = str(exc)
@@ -289,14 +342,22 @@ class GeminiWorker(BaseWorker):
                         self.queue_in.get(), timeout=0.03
                     )
                     batch.append(next_blk)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
 
             batch_pcm = b"".join(b.pcm_data for b in batch)
-            self._current_session_id = batch[-1].session_id
-            self._current_block_index = batch[-1].block_index
-            self._current_source_time = batch[-1].source_time
-            self._last_send_time = time.monotonic()
+            session_id = batch[-1].session_id
+            block_index = batch[-1].block_index
+            source_time = batch[-1].source_time
+            send_time = time.monotonic()
+
+            self._current_session_id = session_id
+            self._current_block_index = block_index
+            self._current_source_time = source_time
+            self._last_send_time = send_time
+            self._sent_batches.append(
+                (session_id, block_index, source_time, send_time)
+            )
 
             blob = types_module.Blob(
                 data=batch_pcm, mime_type="audio/pcm;rate=16000"
@@ -326,7 +387,7 @@ class GeminiWorker(BaseWorker):
             if not server_content:
                 continue
 
-            # Check for transcription
+            # Check for transcription with deduplication
             text: str | None = None
             output_tx = getattr(server_content, "output_transcription", None)
             if output_tx and getattr(output_tx, "text", None):
@@ -339,7 +400,8 @@ class GeminiWorker(BaseWorker):
                         text = part.text.strip()
                         break
 
-            if text:
+            if text and text != self._last_logged_transcript:
+                self._last_logged_transcript = text
                 self._state.last_transcript = text
                 self._log_transcript(
                     session_id=self._current_session_id or "session",
@@ -370,19 +432,34 @@ class GeminiWorker(BaseWorker):
                         )
 
                         now = time.monotonic()
-                        self._state.status = "RUNNING"
-                        self._state.last_audio_time = now
-                        if self._last_send_time > 0:
-                            self._state.latency_s = max(
-                                0.0, now - self._last_send_time
+                        if self._sent_batches:
+                            (
+                                session_id,
+                                block_index,
+                                source_time,
+                                send_time,
+                            ) = self._sent_batches.popleft()
+                            latency_s = max(0.0, now - send_time)
+                        else:
+                            session_id = self._current_session_id or "session"
+                            block_index = self._current_block_index
+                            source_time = self._current_source_time
+                            latency_s = (
+                                max(0.0, now - self._last_send_time)
+                                if self._last_send_time > 0
+                                else 0.0
                             )
 
+                        self._state.status = "RUNNING"
+                        self._state.last_audio_time = now
+                        self._state.latency_s = latency_s
+
                         chunk = BroadcastAudioChunk(
-                            session_id=self._current_session_id or "session",
+                            session_id=session_id,
                             language=self.target_language,
                             source_branch="gemini",
-                            block_index=self._current_block_index,
-                            source_time=self._current_source_time,
+                            block_index=block_index,
+                            source_time=source_time,
                             sample_rate=48000,
                             channels=1,
                             pcm_data=resampled_pcm,
@@ -390,7 +467,12 @@ class GeminiWorker(BaseWorker):
 
                         if self._queue_out.full():
                             try:
-                                _ = self._queue_out.get_nowait()
+                                dropped = self._queue_out.get_nowait()
+                                if dropped is not None:
+                                    logger.warning(
+                                        "GeminiWorker discarded block %d",
+                                        dropped.block_index,
+                                    )
                                 self._state.dropped_blocks_count += 1
                             except asyncio.QueueEmpty:
                                 pass
@@ -402,8 +484,11 @@ class GeminiWorker(BaseWorker):
         while time.monotonic() < deadline and not self._stopped:
             while not self.queue_in.empty():
                 try:
-                    _ = self.queue_in.get_nowait()
+                    dropped = self.queue_in.get_nowait()
                     self._state.dropped_blocks_count += 1
+                    logger.warning(
+                        "GeminiWorker discarded block %d", dropped.block_index
+                    )
                 except asyncio.QueueEmpty:
                     break
             await asyncio.sleep(min(0.05, max(0.01, deadline - time.monotonic())))
