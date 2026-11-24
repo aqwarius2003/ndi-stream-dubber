@@ -149,12 +149,15 @@ Output: `data/test_speech_ru.wav`.
 Run an offline end-to-end verification through the full DSP pipeline, measuring audio latency against the $\le 3.0$ s SLA:
 
 ```bash
-# Fast unpaced test run
+# Fast unpaced test run (accelerated stress test)
 uv run dubber test-run --wav data/test_speech_ru.wav --out-wav output/test_broadcast_en.wav
 
-# Paced real-time test run
+# Paced real-time test run (full evaluation at 20 ms cadence)
 uv run dubber test-run --wav data/test_speech_ru.wav --out-wav output/test_broadcast_en.wav --real-time
 ```
+
+> [!NOTE]
+> Passing `--real-time` paces frame injection at the native 20 ms rate, evaluating the full audio duration across all blocks without drop-oldest buffer overflows. Running without `--real-time` pushes blocks at maximum unthrottled CPU speed, acting as an accelerated stress test that triggers the engine's real-time buffer shedding policy.
 
 Example latency report output:
 ```

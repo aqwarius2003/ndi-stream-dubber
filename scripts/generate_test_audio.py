@@ -16,6 +16,9 @@ def generate_speech_harmonics(
 ) -> np.ndarray:
     """Synthesize speech-like harmonic vowel tones with syllable envelope modulation."""
     num_samples = int(duration_s * sample_rate)
+    if num_samples <= 0:
+        return np.zeros(0, dtype=np.int16)
+
     t = np.linspace(0, duration_s, num_samples, endpoint=False)
 
     # Multi-harmonic stack simulating voiced speech sounds / formants
@@ -68,6 +71,11 @@ def generate_test_speech(
     - Phrase 2 (speech):   3.5s - 5.5s (2.0s duration, ~200 Hz fundamental + harmonics)
     - Trailing silence:     5.5s - 6.0s (0.5s duration, silence)
     """
+    if duration_s < 6.0:
+        raise ValueError(
+            f"duration_s must be >= 6.0s to fit the speech phrases and pauses (got {duration_s}s)"
+        )
+
     total_samples = int(duration_s * sample_rate)
     audio = np.zeros(total_samples, dtype=np.int16)
 
@@ -133,7 +141,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    out_path = generate_test_speech(file_path=args.output, duration_s=args.duration)
+    try:
+        out_path = generate_test_speech(file_path=args.output, duration_s=args.duration)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     print(f"Generated synthetic speech asset: {out_path} ({args.duration:.1f}s, 16 kHz mono 16-bit PCM)")
     return 0
 
