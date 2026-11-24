@@ -38,6 +38,8 @@ class DubberEngine:
         selector: DubSelector | None = None,
         gemini_worker: GeminiWorker | BaseWorker | None = None,
         soniox_worker: SonioxWorker | BaseWorker | None = None,
+        enable_soniox: bool = True,
+        target_language: str = "en",
     ) -> None:
         self.config = config or DubberConfig()
         self.source = source
@@ -55,9 +57,13 @@ class DubberEngine:
                 queue_in=self.queue_gemini,
                 mode=self.config.provider_mode,
                 api_key=self.config.gemini_api_key,
+                target_language=target_language,
             )
 
-        if soniox_worker is not None:
+        if not enable_soniox:
+            self.soniox_worker = None
+            self.queue_soniox = None
+        elif soniox_worker is not None:
             self.soniox_worker: SonioxWorker | BaseWorker = soniox_worker
             self.queue_soniox: asyncio.Queue[AudioBlock] = getattr(
                 soniox_worker, "queue_in", None
@@ -98,6 +104,9 @@ class DubberEngine:
         self._tasks: list[asyncio.Task[Any]] = []
         self._last_sink_write_time: float = 0.0
         self._source_active: bool = False
+        self.last_input_time = 0.0
+        self.last_voice_write_time = 0.0
+        self.io_error: str | None = None
         self._sink_lock: asyncio.Lock = asyncio.Lock()
 
         # Immediately register worker states with the selector
@@ -194,11 +203,13 @@ class DubberEngine:
                     logger.info("Ingest source finished or stopped.")
                     break
                 self._source_active = True
+                self.last_input_time = time.monotonic()
                 await self.dispatch_block_to_queues(block)
         except asyncio.CancelledError:
             pass
-        except Exception:
+        except Exception as exc:
             self._source_active = False
+            self.io_error = str(exc)
             logger.exception("Error in DubberEngine ingest loop")
         finally:
             self._source_active = False
@@ -221,9 +232,12 @@ class DubberEngine:
                     async with self._sink_lock:
                         await self.sink.write_chunk(selected_chunk)
                         self._last_sink_write_time = time.monotonic()
+                        if any(selected_chunk.pcm_data):
+                            self.last_voice_write_time = self._last_sink_write_time
         except asyncio.CancelledError:
             pass
-        except Exception:
+        except Exception as exc:
+            self.io_error = str(exc)
             logger.exception("Error in worker output loop")
 
     async def _silence_heartbeat_loop(self) -> None:
@@ -245,6 +259,7 @@ class DubberEngine:
                     elapsed >= 0.05
                     and (source_active or alert_active)
                     and self.sink is not None
+                    and getattr(self.sink, "realtime", False) is not True
                 ):
                     silence_chunk = self.selector.create_silence_chunk(
                         duration_ms=20.0, session_id="silence"
@@ -254,7 +269,8 @@ class DubberEngine:
                         self._last_sink_write_time = time.monotonic()
         except asyncio.CancelledError:
             pass
-        except Exception:
+        except Exception as exc:
+            self.io_error = str(exc)
             logger.exception("Error in DubberEngine silence heartbeat loop")
 
     async def start(self) -> None:

@@ -20,6 +20,22 @@ from dubber.types import AudioBlock
 logger = logging.getLogger(__name__)
 
 
+def discover_sources() -> list[str]:
+    """Return a snapshot, including senders on this machine."""
+    if ndi is None or not ndi.initialize():
+        raise RuntimeError("Не удалось загрузить NDI Runtime.")
+    finder = ndi.find_create_v2()
+    if not finder:
+        raise RuntimeError("Не удалось запустить поиск NDI.")
+    try:
+        deadline = time.monotonic() + 1.6
+        while time.monotonic() < deadline:
+            ndi.find_wait_for_sources(finder, 150)
+        return sorted({s.ndi_name for s in ndi.find_get_current_sources(finder)})
+    finally:
+        ndi.find_destroy(finder)
+
+
 class NDIAudioSource(AudioSource):
     """Captures audio frames from an NDI source asynchronously in an executor thread,
 
@@ -30,8 +46,10 @@ class NDIAudioSource(AudioSource):
         self,
         source_name: str | None = None,
         session_id: str = "ndi_session",
+        exact_name: bool = False,
     ) -> None:
         self.source_name = source_name
+        self.exact_name = exact_name
         self.session_id = session_id
         self._recv = None
         self._running = False
@@ -39,7 +57,7 @@ class NDIAudioSource(AudioSource):
         self._sample_offset = 0
         self._pcm_buffer = bytearray()
         self._block_bytes = 640  # 320 samples * 2 bytes (20 ms at 16 kHz)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._capture_mode: str | None = None
 
     def _reset_state(self) -> None:
@@ -76,19 +94,22 @@ class NDIAudioSource(AudioSource):
                 if sources:
                     if self.source_name:
                         for s in sources:
-                            if self.source_name.lower() in s.ndi_name.lower():
+                            if (s.ndi_name == self.source_name if self.exact_name
+                                else self.source_name.lower() in s.ndi_name.lower()):
                                 target_source = s
                                 break
                     else:
                         target_source = sources[0]
                     if target_source:
-                        break
+                        # The finder owns the source descriptors until it is destroyed.
+                        return self._create_receiver(target_source)
         finally:
             ndi.find_destroy(find)
 
-        if not target_source:
-            raise RuntimeError(f"NDI source '{self.source_name or 'any'}' not found on the network.")
+        raise RuntimeError(f"NDI source '{self.source_name or 'any'}' not found on the network.")
 
+    @staticmethod
+    def _create_receiver(target_source) -> tuple[object, str]:
         recv_create = ndi.RecvCreateV3()
         recv_create.source_to_connect_to = target_source
         recv_create.color_format = ndi.RECV_COLOR_FORMAT_BGRX_BGRA
@@ -114,16 +135,12 @@ class NDIAudioSource(AudioSource):
         while len(self._pcm_buffer) < self._block_bytes and self._running:
             # Capture frame in thread executor to not block asyncio event loop
             loop = asyncio.get_running_loop()
-            audio_frame = await loop.run_in_executor(None, self._capture_frame)
-            if audio_frame is None:
+            pcm_chunk = await loop.run_in_executor(None, self._capture_pcm)
+            if not pcm_chunk:
                 await asyncio.sleep(0.005)
                 continue
 
-            try:
-                pcm_chunk = self._process_frame_to_pcm16_16k(audio_frame)
-                self._pcm_buffer.extend(pcm_chunk)
-            finally:
-                self._free_frame(audio_frame)
+            self._pcm_buffer.extend(pcm_chunk)
 
         if len(self._pcm_buffer) >= self._block_bytes:
             data = bytes(self._pcm_buffer[: self._block_bytes])
@@ -141,6 +158,17 @@ class NDIAudioSource(AudioSource):
             return block
 
         return None
+
+    def _capture_pcm(self) -> bytes:
+        # Keep native frame ownership in the capture thread even if read_block is cancelled.
+        with self._lock:
+            frame = self._capture_frame()
+            if frame is None:
+                return b""
+            try:
+                return self._process_frame_to_pcm16_16k(frame)
+            finally:
+                self._free_frame(frame)
 
     def _capture_frame(self):
         with self._lock:

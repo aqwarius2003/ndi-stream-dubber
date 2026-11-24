@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PharmaLive · Синхронный перевод</title>
+<style>
+:root{color-scheme:dark;font:16px/1.55 "Segoe UI",Arial,sans-serif;background:#101718;color:#edf5f2}
+*{box-sizing:border-box}body{max-width:1100px;margin:auto;padding:28px clamp(18px,5vw,64px) 50px}
+header{display:flex;align-items:center;gap:12px;padding-bottom:22px;border-bottom:1px solid #354345;font-weight:650}
+.mark{width:32px;height:32px;display:inline-grid;place-items:center;background:#abf3ce;color:#162321;border-radius:8px}
+.tag{margin-left:auto;color:#a2b6b0;font:13px Consolas,monospace}
+h1{font-size:clamp(30px,5vw,52px);font-weight:560;line-height:1.12;letter-spacing:-.035em;margin:40px 0 26px}
+main{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:16px}
+section{background:#192324;border:1px solid #324142;border-radius:14px;padding:24px}
+h2{font-size:19px;margin:0 0 22px}label,.label{display:block;color:#b9c9c3;font-size:14px;margin:18px 0 7px}
+select,input,button{font:inherit;border-radius:7px}select,input{background:#11191a;color:inherit;border:1px solid #526160;padding:10px;width:100%}
+button{border:1px solid #53635e;color:inherit;background:#25322f;padding:9px 14px;cursor:pointer}
+button:disabled,select:disabled{opacity:.55;cursor:default}.row{display:flex;gap:8px}.row select{min-width:0}
+.primary{background:#abf3ce;color:#112b1e;border:0;font-weight:650;margin-top:24px;width:100%}
+.stop{background:#563633;color:#ffe6e2}code{font:20px Consolas,monospace;color:#abf3ce;overflow-wrap:anywhere}
+dl{padding:0;margin:18px 0 0}dl div{display:flex;justify-content:space-between;gap:10px;border-top:1px solid #354344;padding:10px 0}dt{color:#a9bcb4}dd{margin:0;text-align:right}
+#message{color:#ffd3a3}#message:empty{display:none}.transcript{grid-column:1/-1}
+#words{font-size:21px;margin:0;overflow-wrap:anywhere}small{color:#a9bcb4}details{margin-top:16px}summary{cursor:pointer}
+@media(max-width:700px){main{grid-template-columns:1fr}section{padding:18px}h1{margin-top:28px}}
+</style>
+<header><span class="mark" aria-hidden="true">≋</span>PharmaLive <span class="tag">NDI / LIVE</span></header>
+<h1>Синхронный перевод</h1>
+<main>
+<section><h2>Настройка эфира</h2>
+<label for="source">Источник NDI</label><div class="row"><select id="source"></select><button id="refresh">Обновить</button></div>
+<small id="hint"></small>
+<label for="direction">Направление перевода</label><select id="direction">
+<option value="ru-en">Русский → Английский</option><option value="ru-de">Русский → Немецкий</option><option value="en-ru">Английский → Русский</option></select>
+<details id="credentials"><summary id="keyLabel">Ключ Gemini</summary><label for="key">Ключ для этой сессии</label><input type="password" id="key" autocomplete="off" spellcheck="false"></details>
+<button id="action" class="primary" disabled>Начать перевод</button><p role="alert" id="message"></p>
+</section>
+<section><h2>Контроль сигнала</h2>
+<span class="label">Выход NDI для vMix</span><code id="output">Dub_EN</code>
+<dl><div><dt>Сессия</dt><dd id="session">Остановлена</dd></div>
+<div><dt>Входное аудио</dt><dd id="inputState">—</dd></div>
+<div><dt>Gemini Live</dt><dd id="provider">—</dd></div><div><dt>Озвучка на выходе</dt><dd id="voice">—</dd></div>
+<div><dt>Автобуфер</dt><dd id="buffer">—</dd></div></dl></section>
+<section class="transcript"><h2>Последний фрагмент перевода</h2><p id="words">Ожидание перевода</p></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let running=false,busy=false,scanning=false,online=false,configured=false,requestError='';
+const outputs={'ru-en':'Dub_EN','ru-de':'Dub_DE','en-ru':'Dub_RU'};
+async function api(path,options){
+ const r=await fetch('/api/'+path,options);
+ if(!r.ok){const e=await r.json().catch(()=>({}));throw Error(typeof e.detail==='string'?e.detail:'Ошибка запроса ('+r.status+')')}
+ return r.json();
+}
+function controls(){
+ $('action').disabled=busy||!online||(!running&&(scanning||!$('source').value||(!configured&&!$('key').value.trim())));
+ for(const id of ['source','direction','key'])$(id).disabled=busy||running;
+ $('refresh').disabled=busy||running||scanning;
+ $('action').textContent=busy?'Подождите…':running?'Остановить перевод':'Начать перевод';
+ $('action').classList.toggle('stop',running);
+}
+function render(s){
+ online=true;running=s.running;configured=s.key_configured;
+ $('keyLabel').textContent=configured?'Ключ Gemini подключён':'Ключ Gemini';
+ if(running){
+   if(!Array.from($('source').options).some(o=>o.value===s.source))$('source').add(new Option(s.source,s.source));
+   $('source').value=s.source;$('direction').value=s.direction;
+ }
+ $('output').textContent=s.output||outputs[$('direction').value];
+ $('session').textContent=running?'Запущена':'Остановлена';
+ $('inputState').textContent=running?(s.input_active?'Поступает':'Ожидание сигнала'):'—';
+ const states={STARTING:'Подключение',READY:'Подключён',RUNNING:'Переводит',ERROR:'Ошибка',STOPPED:'Остановлен'};
+ $('provider').textContent=states[s.provider]||'—';
+ $('buffer').textContent=Number.isFinite(s.buffer_target_ms)?s.buffer_target_ms+' мс':'—';
+ $('voice').textContent=running?(s.voice_active?'Передаётся':'Ожидание речи'):'—';
+ $('words').textContent=s.transcript||'Ожидание перевода';
+ $('message').textContent=s.error||requestError;controls();
+}
+async function scan(){
+ scanning=true;controls();$('hint').textContent='Поиск источников…';
+ try{const names=await api('sources'),old=$('source').value;
+ $('source').replaceChildren(...names.map(n=>new Option(n,n)));
+ if(names.includes(old))$('source').value=old;
+ $('hint').textContent=names.length?'':'Включите выход NDI в vMix и нажмите «Обновить».';
+ }catch(e){$('hint').textContent=e.message}finally{scanning=false;controls()}
+}
+async function poll(){
+ if(!busy){try{const s=await api('status');if(!busy)render(s)}catch{online=false;$('session').textContent='Связь с панелью потеряна';controls()}}
+ setTimeout(poll,1000);
+}
+$('action').onclick=async()=>{
+ busy=true;requestError='';controls();
+ try{const s=running?await api('stop',{method:'POST'}):await api('start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:$('source').value,direction:$('direction').value,api_key:$('key').value.trim()||null})});
+ $('key').value='';render(s)}
+ catch(e){requestError=e.message;$('message').textContent=requestError}
+ finally{busy=false;controls()}
+};
+$('refresh').onclick=scan;$('direction').onchange=()=>{$('output').textContent=outputs[$('direction').value]};
+$('key').oninput=controls;$('source').onchange=controls;
+(async()=>{try{const s=await api('status');render(s);if(!configured&&!running)$('credentials').open=true;if(!running)await scan()}finally{poll()}})();
+</script>
+</html>

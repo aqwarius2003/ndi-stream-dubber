@@ -90,7 +90,7 @@ class GeminiWorker(BaseWorker):
         self._emission_tasks.clear()
         self._sent_batches.clear()
         self._last_logged_transcript = ""
-        self._state.status = "READY"
+        self._state.status = "READY" if self.mode == "mock" else "STARTING"
         if self.mode == "mock":
             self._worker_task = asyncio.create_task(self._mock_loop())
         else:
@@ -386,7 +386,15 @@ class GeminiWorker(BaseWorker):
 
     async def _live_receiver(self, session: Any) -> None:
         """Receive translated audio and transcription from Gemini Live session."""
+        while not self._stopped:
+            if not await self._receive_turn(session):
+                raise ConnectionError("Gemini closed the audio stream")
+
+    async def _receive_turn(self, session: Any) -> bool:
+        # The SDK ends each iterator at a turn boundary, while the socket stays open.
+        received = False
         async for response in session.receive():
+            received = True
             if self._stopped:
                 break
             server_content = getattr(response, "server_content", None)
@@ -483,6 +491,7 @@ class GeminiWorker(BaseWorker):
                             except asyncio.QueueEmpty:
                                 pass
                         await self._queue_out.put(chunk)
+        return received
 
     async def _drain_queue_during_error(self, duration: float) -> None:
         """Discard incoming blocks during error/reconnection to avoid stale queues."""

@@ -1,7 +1,7 @@
 [project]
-name = "pharmalive-dubber"
+name = "ndi-stream-dubber"
 version = "0.1.0"
-description = "PharmaLive Dubber: Real-time dual-branch RU->EN simultaneous dubbing system"
+description = "NDI Stream Dubber: Broadcast-grade real-time simultaneous audio translation"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

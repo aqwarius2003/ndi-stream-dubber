@@ -1,5 +1,6 @@
 """Unit and integration tests for AudioSink interface, WAVAudioSink, and NDIAudioSink."""
 
+import asyncio
 import wave
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +11,29 @@ from dubber.sink.base import AudioSink
 from dubber.sink.ndi_sink import NDIAudioSink
 from dubber.sink.wav_sink import WAVAudioSink
 from dubber.types import BroadcastAudioChunk
+
+
+async def test_realtime_ndi_buffers_bursts_and_clocks_silence_independently():
+    with patch("dubber.sink.ndi_sink.ndi") as ndi:
+        frames = []
+        ndi.AudioFrameV3.side_effect = lambda: MagicMock()
+        ndi.send_send_audio_v3.side_effect = lambda _, frame: frames.append(frame.data.copy())
+        sink = NDIAudioSink(realtime=True)
+        async with sink:
+            audio = np.arange(12000, dtype=np.int16)
+            chunk = BroadcastAudioChunk("live", "en", "gemini", 0, 0, 48000, 1, audio.tobytes())
+            assert ndi.send_create.call_args.args[0].clock_audio is False
+            await sink.write_chunk(chunk)
+            assert not frames
+            async with asyncio.timeout(2):
+                while not any(np.any(f) for f in frames) or sum(f.size for f in frames if np.any(f)) < 12000:
+                    await asyncio.sleep(.01)
+                while np.any(frames[-1]):
+                    await asyncio.sleep(.01)
+        assert all(f.shape == (1, 960) for f in frames)
+        voiced = np.concatenate([f.ravel() for f in frames if np.any(f)])
+        np.testing.assert_array_equal(voiced[:12000], audio.astype(np.float32) / 32768)
+        assert np.all(voiced[12000:] == 0)
 
 
 @pytest.mark.asyncio

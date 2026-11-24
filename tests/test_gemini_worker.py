@@ -471,3 +471,22 @@ async def test_gemini_worker_mock_audible_tone(tmp_path):
 
 
 
+@pytest.mark.asyncio
+async def test_live_receiver_reads_multiple_turns_on_same_connection(tmp_path):
+    from types import SimpleNamespace
+
+    worker = GeminiWorker(asyncio.Queue(), mode="live", transcript_path=str(tmp_path / "live.jsonl"))
+    phrases = iter(["First sentence", "Second sentence"])
+
+    async def receive():
+        phrase = next(phrases, None)
+        if phrase:
+            yield SimpleNamespace(server_content=SimpleNamespace(
+                model_turn=None, output_transcription=SimpleNamespace(text=phrase),
+            ))
+
+    try:
+        await worker._live_receiver(SimpleNamespace(receive=receive))
+    except ConnectionError:
+        pass
+    assert worker.get_state().last_transcript == "Second sentence"

@@ -168,7 +168,7 @@ async def run_operator_service(args: argparse.Namespace) -> int:
         try:
             from dubber.sink.ndi_sink import NDIAudioSink
 
-            sink = NDIAudioSink(sink_name=config.ndi_sink_name)
+            sink = NDIAudioSink(sink_name=config.ndi_sink_name, realtime=True)
         except (RuntimeError, ImportError, OSError) as exc:
             logger.warning(
                 "Could not initialize NDIAudioSink (%s). Falling back to WAVAudioSink('%s').",
@@ -227,9 +227,11 @@ def build_parser() -> argparse.ArgumentParser:
     """Construct CLI argument parser with run and test-run subcommands."""
     parser = argparse.ArgumentParser(
         prog="dubber",
-        description="PharmaLive Dubber: Real-time dual-branch RU->EN simultaneous dubbing",
+        description="NDI Stream Dubber: Real-time broadcast simultaneous dubbing system",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
+    web = subparsers.add_parser("web", help="Open the local NDI live translation control panel")
+    web.add_argument("--port", type=int, default=8000)
 
     # 'run' subcommand
     run_parser = subparsers.add_parser("run", help="Launch live dubbing pipeline with API and TUI")
@@ -372,6 +374,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
+    if args.command == "web":
+        from dubber.operator.web import create_web_app
+
+        print(f"NDI Stream Dubber: http://127.0.0.1:{args.port}", flush=True)
+        uvicorn.run(create_web_app(), host="127.0.0.1", port=args.port)
+        return 0
     if args.command == "run":
         return asyncio.run(run_operator_service(args))
     elif args.command == "test-run":
