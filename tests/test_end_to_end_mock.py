@@ -29,6 +29,18 @@ def test_latency_analyzer_and_report():
     assert "phrase_2" in report
 
 
+def test_report_execution_type_and_mode():
+    analyzer = LatencyAnalyzer(max_allowed_s=3.0)
+    r1 = analyzer.compute_latency("phrase_1", 0.0, 1.2)
+    report = generate_latency_report(
+        [r1],
+        execution_type="File Run (WAV)",
+        provider_mode="mock",
+    )
+    assert "Execution Type:        File Run (WAV)" in report
+    assert "Provider Mode:         mock" in report
+
+
 def test_detect_speech_start():
     analyzer = LatencyAnalyzer(energy_threshold=500.0)
     sr = 48000
@@ -43,6 +55,15 @@ def test_detect_speech_start():
     # Pure silence must return -1.0
     silent_audio = np.zeros(sr, dtype=np.int16)
     assert analyzer.detect_speech_start(silent_audio, sample_rate=sr) == -1.0
+
+
+def test_detect_speech_start_low_amplitude_noise():
+    analyzer = LatencyAnalyzer(energy_threshold=500.0)
+    sr = 48000
+    # int16 noise with values strictly in {-1, 0, 1} must not be scaled to 32767
+    rng = np.random.default_rng(42)
+    noise = rng.choice([-1, 0, 1], size=sr).astype(np.int16)
+    assert analyzer.detect_speech_start(noise, sample_rate=sr) == -1.0
 
 
 @pytest.mark.asyncio
@@ -110,6 +131,7 @@ async def test_cli_test_run(tmp_path, capsys):
 
     captured = capsys.readouterr().out
     assert "PHARMALIVE DUBBER LATENCY REPORT" in captured
+    assert "Execution Type:        File Run (WAV)" in captured
 
 
 def test_empty_latency_report():
@@ -165,6 +187,7 @@ def test_cli_flags_parsing():
     assert run_args.wav == "data/custom_ru.wav"
     assert run_args.out_wav == "output/custom_out.wav"
     assert run_args.no_tui is True
+    assert run_args.active_branch is None
 
     # Verify run flags alias --wav-file
     run_alias_args = parser.parse_args([
@@ -212,6 +235,7 @@ async def test_run_operator_service_headless(tmp_path):
         "--wav", str(in_wav),
         "--out-wav", str(out_wav),
         "--state-file", str(state_file),
+        "--active-branch", "gemini",
         "--port", "8999",
         "--host", "127.0.0.1",
         "--no-tui",
@@ -232,6 +256,57 @@ async def test_run_operator_service_headless(tmp_path):
         assert status_code == 200
         assert "active_branch" in data
         assert data["active_branch"] == "gemini"
+    finally:
+        service_task.cancel()
+        try:
+            await service_task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_run_preserves_state_when_active_branch_omitted(tmp_path):
+    in_wav = tmp_path / "in.wav"
+    out_wav = tmp_path / "out.wav"
+    state_file = tmp_path / "state.json"
+
+    # Pre-populate state.json with active_branch="soniox"
+    state_file.write_text(json.dumps({"active_branch": "soniox"}), encoding="utf-8")
+
+    samples = (0.5 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.2, 3200, endpoint=False)) * 32767).astype(np.int16)
+    with wave.open(str(in_wav), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(samples.tobytes())
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "run",
+        "--source", "wav",
+        "--sink", "wav",
+        "--wav", str(in_wav),
+        "--out-wav", str(out_wav),
+        "--state-file", str(state_file),
+        "--port", "8998",
+        "--host", "127.0.0.1",
+        "--no-tui",
+    ])
+    assert args.active_branch is None
+
+    service_task = asyncio.create_task(run_operator_service(args))
+    await asyncio.sleep(0.5)
+
+    try:
+        loop = asyncio.get_running_loop()
+
+        def fetch():
+            with urllib.request.urlopen("http://127.0.0.1:8998/status", timeout=2.0) as req:
+                return req.status, json.loads(req.read().decode("utf-8"))
+
+        status_code, data = await loop.run_in_executor(None, fetch)
+        assert status_code == 200
+        assert data["active_branch"] == "soniox"
     finally:
         service_task.cancel()
         try:

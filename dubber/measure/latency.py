@@ -43,7 +43,13 @@ def detect_speech_start(
         data = np.mean(data, axis=1 if data.shape[1] < data.shape[0] else 0)
 
     # If normalized float in [-1.0, 1.0] but threshold is in int16 scale (> 1.0):
-    if threshold > 1.0 and np.max(np.abs(data)) <= 1.0 and np.max(np.abs(data)) > 0:
+    # Only scale if original input audio was floating-point, preventing low-amplitude int16 noise from scaling.
+    if (
+        np.issubdtype(audio_data.dtype, np.floating)
+        and threshold > 1.0
+        and np.max(np.abs(data)) <= 1.0
+        and np.max(np.abs(data)) > 0
+    ):
         data = data * 32767.0
 
     window_samples = max(1, int(sample_rate * (window_ms / 1000.0)))

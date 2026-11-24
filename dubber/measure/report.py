@@ -8,15 +8,20 @@ from dubber.measure.latency import LatencyResult
 def generate_latency_report(
     results: list[LatencyResult],
     threshold_s: float = 3.0,
+    execution_type: str = "Live",
+    provider_mode: str = "live",
 ) -> str:
     """Generate a clean, human-readable latency evaluation report.
 
     Calculates p50, p95, min, max, and pass/fail against 3.0s threshold.
+    Identifies file runs vs live broadcasts, and mock simulations vs real APIs.
     """
     lines = [
         "=" * 68,
         "               PHARMALIVE DUBBER LATENCY REPORT",
         "=" * 68,
+        f"Execution Type:        {execution_type}",
+        f"Provider Mode:         {provider_mode}",
     ]
 
     if not results:

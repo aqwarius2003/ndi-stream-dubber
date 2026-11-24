@@ -74,6 +74,7 @@ async def run_test_pipeline(
     max_allowed_s: float = 3.0,
     simulated_delay_s: float = 0.05,
     real_time_pace: bool = False,
+    timeout_s: float = 60.0,
 ) -> int:
     """Execute reproducible WAV test run, measure latency, and print SLA report."""
     if not os.path.exists(wav_input):
@@ -104,19 +105,27 @@ async def run_test_pipeline(
     engine.selector.switch_branch(active_branch, force=True)  # type: ignore[arg-type]
 
     await engine.start()
+    start_time = time.monotonic()
     try:
         while source._running:
+            if time.monotonic() - start_time > timeout_s:
+                raise TimeoutError(f"WAVAudioSource processing timed out after {timeout_s}s")
             await asyncio.sleep(0.05)
         # Allow worker processing queues to flush
         await asyncio.sleep(simulated_delay_s * 2 + 0.2)
     finally:
         await engine.stop()
 
-    report = generate_latency_report(sink.results, threshold_s=max_allowed_s)
+    report = generate_latency_report(
+        sink.results,
+        threshold_s=max_allowed_s,
+        execution_type="File Run (WAV)",
+        provider_mode=mode,
+    )
     print(report)
 
     all_passed = all(r.passed for r in sink.results)
-    return 0 if (all_passed and len(sink.results) > 0) or len(sink.results) == 0 else 1
+    return 0 if all_passed and len(sink.results) > 0 else 1
 
 
 async def run_operator_service(args: argparse.Namespace) -> int:
@@ -169,8 +178,8 @@ async def run_operator_service(args: argparse.Namespace) -> int:
             sink = WAVAudioSink(out_wav_path)
 
     engine = DubberEngine(config, source=source, sink=sink)
-    active_branch = getattr(args, "active_branch", "gemini")
-    if active_branch:
+    active_branch = getattr(args, "active_branch", None)
+    if active_branch is not None:
         engine.selector.switch_branch(active_branch, force=True)
 
     await engine.start()
@@ -193,6 +202,8 @@ async def run_operator_service(args: argparse.Namespace) -> int:
             print(f"PharmaLive Dubber running. Control API: http://{config.http_host}:{config.http_port}")
             print("Press Ctrl+C to terminate.")
             while not stop_event.is_set():
+                if server_task.done():
+                    server_task.result()
                 await asyncio.sleep(0.5)
         else:
             from dubber.operator.cli import run_operator_tui
@@ -266,8 +277,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--active-branch",
         choices=["gemini", "soniox"],
-        default="gemini",
-        help="Initial active broadcast branch (default: gemini)",
+        default=None,
+        help="Initial active broadcast branch override (default: preserve saved route)",
     )
     run_parser.add_argument(
         "--port",
